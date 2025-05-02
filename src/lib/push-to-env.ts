@@ -74,7 +74,7 @@ async function uploadAsset(url: string) {
   const fullPath = urlObj.pathname;
   const noSlashFullPath = fullPath.replace(/^\/+/, '');
 
-  const response = await fetch(url);
+  const response = await fetch(`${urlObj.origin}${fullPath}`);
   if (!response.ok) {
     console.error(`Error fetching file from ${url}`);
     // throw new Error(`Error fetching file from ${url}`)
@@ -97,7 +97,7 @@ async function uploadAsset(url: string) {
     };
 
     const responseUrl = new URL(`${publicDomain}/${s3_key}`);
-    responseUrl.search = urlObj.searchParams.toString();
+    // responseUrl.search = urlObj.searchParams.toString();
     // console.log('responseUrl:', responseUrl.href)
 
     try {
@@ -189,7 +189,7 @@ async function replaceUrls(
               // console.log('File already exists in S3')
               uploadedFile = {
                 key: `builder/${s3_key}`,
-                url: `${publicDomain}/${s3_key}${extractedUrlObj.search}`,
+                url: `${publicDomain}/${s3_key}`,
                 // ext: fileExtension,
               };
               // console.log(uploadedFile)
