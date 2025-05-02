@@ -20,7 +20,7 @@ app.post('/api/deploy', (req: Request, res: Response): any => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   pushToEnvironment().then(() => {
-    console.log('Deployment promise resolved');
+    // console.log('Deployment promise resolved');
     if (vercelDeployWebhook) {
       console.log('Triggering Vercel deployment');
       fetch(vercelDeployWebhook, {
