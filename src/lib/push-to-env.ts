@@ -317,19 +317,19 @@ export const pushToEnvironment = async (pageId?: string) => {
 
     const s3_key = path.join('builder', 'pages', filePath, fileName);
 
-    const params: any = {
-      Bucket: process.env.AWS_BUCKET_NAME,
-      Key: s3_key,
-      Body: JSON.stringify(page, null, 2),
-      ContentType: 'application/json',
-    };
-    s3.upload(params, (err: any) => {
-      if (err) {
-        console.error('Error uploading file', err);
-      } else {
-        console.log(`Successfully uploaded file ${s3_key}`);
-      }
-    });
+    try {
+      const params: any = {
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: s3_key,
+        Body: JSON.stringify(page, null, 2),
+        ContentType: 'application/json',
+      };
+      await s3.upload(params).promise();
+      console.log(`Successfully uploaded file ${s3_key}`);
+    } catch (err) {
+      console.error('Error uploading file', err);
+      throw err;
+    }
 
     invalidationPaths.push(`/${s3_key}`);
   }
@@ -346,14 +346,10 @@ export const pushToEnvironment = async (pageId?: string) => {
   };
   // console.log(JSON.stringify(invalidationParams, null, 2))
 
-  cloudfront.createInvalidation(
-    invalidationParams,
-    (err: any /*data: any*/) => {
-      if (err) {
-        console.error('Error creating CloudFront invalidation', err);
-      } else {
-        // console.log('Successfully created CloudFront invalidation', data);
-      }
-    },
-  );
+  try {
+    await cloudfront.createInvalidation(invalidationParams).promise();
+  } catch (error) {
+    console.error('Error creating invalidation:', error);
+    throw error;
+  }
 };

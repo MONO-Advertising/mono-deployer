@@ -20,7 +20,7 @@ app.post('/api/deploy', (req: Request, res: Response): any => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   pushToEnvironment().then(() => {
-    return fetch(vercelDeployWebhook, {
+    fetch(vercelDeployWebhook, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
