@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import path from 'path';
 import { fetchEntries, fetchOneEntry } from '@builder.io/sdk-react';
 import * as AWS from 'aws-sdk';
