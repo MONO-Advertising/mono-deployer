@@ -1,11 +1,13 @@
-import dotenv from 'dotenv';
-dotenv.config();
+// import dotenv from 'dotenv';
+// dotenv.config();
+console.log('lib:', process.env);
 import path from 'path';
 import { fetchEntries, fetchOneEntry } from '@builder.io/sdk-react';
 import * as AWS from 'aws-sdk';
 // import uniq from 'lodash/uniq'
 // import fetch from 'node-fetch'
 // import { fileTypeFromBuffer } from 'file-type'
+
 
 if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
   throw new Error('AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set');

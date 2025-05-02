@@ -1,5 +1,6 @@
-import dotenv from 'dotenv';
-dotenv.config();
+// import dotenv from 'dotenv';
+// dotenv.config();
+console.log('main:', process.env);
 import express, { Request, Response } from 'express';
 import { pushToEnvironment } from './lib/push-to-env';
 
