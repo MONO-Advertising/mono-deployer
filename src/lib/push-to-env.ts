@@ -252,6 +252,8 @@ export const pushToEnvironment = async (pageId?: string) => {
 
   // console.log(pages);
 
+  const invalidationPaths: string[] = []
+
   for (const page of pages) {
     const symbols: any[] = [];
     const findSymbols = (blocks: any) => {
@@ -329,27 +331,29 @@ export const pushToEnvironment = async (pageId?: string) => {
       }
     });
 
-    const invalidationParams = {
-      DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, // Ensure this environment variable is set
-      InvalidationBatch: {
-        CallerReference: new Date().toISOString(), // Unique value to ensure the invalidation is processed
-        Paths: {
-          Quantity: 1,
-          Items: [`/${s3_key}`], // Invalidate the specific file path
-        },
-      },
-    };
-    // console.log(JSON.stringify(invalidationParams, null, 2))
-
-    cloudfront.createInvalidation(
-      invalidationParams,
-      (err: any /*data: any*/) => {
-        if (err) {
-          console.error('Error creating CloudFront invalidation', err);
-        } else {
-          // console.log('Successfully created CloudFront invalidation', data);
-        }
-      },
-    );
+    invalidationPaths.push(`/${s3_key}`);
   }
+
+  const invalidationParams = {
+    DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, // Ensure this environment variable is set
+    InvalidationBatch: {
+      CallerReference: new Date().toISOString(), // Unique value to ensure the invalidation is processed
+      Paths: {
+        Quantity: invalidationPaths.length,
+        Items: invalidationPaths, // Invalidate the specific file path
+      },
+    },
+  };
+  // console.log(JSON.stringify(invalidationParams, null, 2))
+
+  cloudfront.createInvalidation(
+    invalidationParams,
+    (err: any /*data: any*/) => {
+      if (err) {
+        console.error('Error creating CloudFront invalidation', err);
+      } else {
+        // console.log('Successfully created CloudFront invalidation', data);
+      }
+    },
+  );
 };
