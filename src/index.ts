@@ -10,6 +10,10 @@ const vercelDeployWebhook = process.env.VERCEL_DEPLOY_WEBHOOK!;
 
 app.use(express.json());
 
+app.get('/', (req: Request, res: Response): any => {
+  return res.status(200).json({ message: 'All your base are belong to us.' });
+});
+
 app.post('/api/deploy', (req: Request, res: Response): any => {
   const headerKey = req.header('x-deployment-key');
   if (!deployKey || headerKey !== deployKey) {
