@@ -12,6 +12,18 @@ if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
   throw new Error('AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set');
 }
 
+if (!process.env.NEXT_PUBLIC_BUILDER_API_KEY) {
+  throw new Error('NEXT_PUBLIC_BUILDER_API_KEY must be set');
+}
+
+if (!process.env.AWS_BUCKET_NAME) {
+  throw new Error('AWS_BUCKET_NAME must be set');
+}
+
+if (!process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID) {
+  throw new Error('AWS_CLOUDFRONT_DISTRIBUTION_ID must be set');
+}
+
 const s3 = new AWS.S3({
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -19,11 +31,47 @@ const s3 = new AWS.S3({
 
 const cloudfront = new AWS.CloudFront();
 
-const apiKey = process.env.NEXT_PUBLIC_BUILDER_API_KEY!;
+const apiKey = process.env.NEXT_PUBLIC_BUILDER_API_KEY;
 
 // const uploadDomain = `https://${process.env.AWS_BUCKET_NAME}.s3.amazonaws.com`
 const publicDomain = 'https://d1ttqs35fxgawv.cloudfront.net/builder';
 const builderDomain = 'https://cdn.builder.io';
+
+/**
+ * Safely decodes a URL path to prevent encoded characters like %2F from appearing in file paths
+ */
+function safeDecodePath(path: string): string {
+  if (!path) return path;
+  
+  try {
+    const decoded = decodeURIComponent(path);
+    // Additional safety check to ensure no encoded characters remain
+    if (decoded.includes('%')) {
+      console.warn('Path still contains encoded characters after decoding:', path);
+      // Try to decode again in case of double encoding
+      return decodeURIComponent(decoded);
+    }
+    return decoded;
+  } catch (error) {
+    console.warn('Failed to decode path:', path, error);
+    return path;
+  }
+}
+
+/**
+ * Sanitizes a filename to be safe for S3 storage
+ */
+function sanitizeFilename(filename: string): string {
+  if (!filename) return 'index';
+  
+  // Remove or replace characters that could cause issues in S3
+  return filename
+    .replace(/[<>:"/\\|?*]/g, '_') // Replace problematic characters with underscores
+    .replace(/\s+/g, '_') // Replace spaces with underscores
+    .replace(/__+/g, '_') // Replace multiple underscores with single
+    .replace(/^_+|_+$/g, '') // Remove leading/trailing underscores
+    .substring(0, 255); // Limit length for S3 compatibility
+}
 
 function extractUrl(str: string): string {
   const regex = /(http[s]?:\/\/[^\s\)]+)/g;
@@ -72,48 +120,48 @@ async function uploadAsset(url: string) {
   // console.log('urlObj.searchParams:', urlObj.searchParams)
   // console.log('urlObj.search:', urlObj.search)
   const fullPath = urlObj.pathname;
-  const noSlashFullPath = fullPath.replace(/^\/+/, '');
+  // Ensure the pathname is properly decoded to prevent %2F and other encoded characters
+  const decodedPath = safeDecodePath(fullPath);
+  const noSlashFullPath = decodedPath.replace(/^\/+/, '');
 
   const response = await fetch(`${urlObj.origin}${fullPath}`);
   if (!response.ok) {
     console.error(`Error fetching file from ${url}`);
-    // throw new Error(`Error fetching file from ${url}`)
+    throw new Error(`Error fetching file from ${url}: ${response.status} ${response.statusText}`);
   }
 
-  if (response.ok) {
-    const contentType = response.headers.get('content-type');
-    const ext = getFileExtension(contentType || '');
+  const contentType = response.headers.get('content-type');
+  const ext = getFileExtension(contentType || '');
 
-    const arrayBuffer = await response.arrayBuffer();
-    const fileBuffer = Buffer.from(arrayBuffer);
+  const arrayBuffer = await response.arrayBuffer();
+  const fileBuffer = Buffer.from(arrayBuffer);
 
-    const s3_key = `${noSlashFullPath}${ext ? `.${ext}` : ''}`;
+  const s3_key = `${noSlashFullPath}${ext ? `.${ext}` : ''}`;
 
-    const params: any = {
-      Bucket: process.env.AWS_BUCKET_NAME,
-      Key: `builder/${s3_key}`,
-      Body: fileBuffer,
-      ContentType: contentType,
+  const params: any = {
+    Bucket: process.env.AWS_BUCKET_NAME,
+    Key: `builder/${s3_key}`,
+    Body: fileBuffer,
+    ContentType: contentType,
+  };
+
+  const responseUrl = new URL(`${publicDomain}/${s3_key}`);
+  // responseUrl.search = urlObj.searchParams.toString();
+  // console.log('responseUrl:', responseUrl.href)
+
+  try {
+    await s3.upload(params).promise();
+    // console.log(`Successfully uploaded file ${s3_key}`)
+    const returnData = {
+      key: `builder/${s3_key}`,
+      url: responseUrl.href,
+      // ext,
     };
-
-    const responseUrl = new URL(`${publicDomain}/${s3_key}`);
-    // responseUrl.search = urlObj.searchParams.toString();
-    // console.log('responseUrl:', responseUrl.href)
-
-    try {
-      await s3.upload(params).promise();
-      // console.log(`Successfully uploaded file ${s3_key}`)
-      const returnData = {
-        key: `builder/${s3_key}`,
-        url: responseUrl.href,
-        // ext,
-      };
-      console.log(returnData);
-      return returnData;
-    } catch (err) {
-      console.error('Error uploading file', err);
-      throw err;
-    }
+    console.log(returnData);
+    return returnData;
+  } catch (err) {
+    console.error('Error uploading file', err);
+    throw err;
   }
 }
 
@@ -121,7 +169,14 @@ async function replaceUrls(
   obj: any,
   oldDomain: string,
   newDomain: string,
+  depth: number = 0,
 ): Promise<string[]> {
+  // Prevent infinite recursion
+  if (depth > 10) {
+    console.warn('Maximum recursion depth reached in replaceUrls');
+    return [];
+  }
+
   const regex = /(http[s]?:\/\/[^\s\)]+)/g;
   let urls: string[] = [];
 
@@ -146,6 +201,11 @@ async function replaceUrls(
             const extractedUrl = extractUrl(decodedUrl);
             // console.log('extractedUrl:', extractedUrl)
 
+            if (!extractedUrl) {
+              console.warn('Could not extract URL from:', match);
+              continue;
+            }
+
             const extractedUrlObj = new URL(extractedUrl);
 
             // console.log('extractedUrlObj:', extractedUrlObj)
@@ -157,9 +217,15 @@ async function replaceUrls(
             // extractedUrl = extractedUrl.replace("?placeholderIfAbsent=true","")
             // console.log('extractedUrl replaced:', extractedUrl)
 
-            const contentType = (await fetch(extractedUrl)).headers
-              .get('content-type')
-              ?.split(';')[0];
+            let contentType: string | null = null;
+            try {
+              const fetchResponse = await fetch(extractedUrl);
+              contentType = fetchResponse.headers.get('content-type')?.split(';')[0] || null;
+            } catch (error) {
+              console.error('Error fetching content type for:', extractedUrl, error);
+              continue;
+            }
+
             // console.log('contentType:', contentType)
             const fileExtension = getFileExtension(contentType || '');
             // console.log('fileExtension:', fileExtension)
@@ -168,7 +234,9 @@ async function replaceUrls(
               // console.log(`Skipping ${extractedUrl}. It is not an image or video`)
               continue;
             }
-            const s3_key = `${extractedUrlObj.pathname.replace(/^\/+/, '')}.${fileExtension}`;
+            // Ensure the pathname is properly decoded to prevent %2F and other encoded characters
+            const decodedPathname = safeDecodePath(extractedUrlObj.pathname);
+            const s3_key = `${decodedPathname.replace(/^\/+/, '')}.${fileExtension}`;
             // console.log(`KEY: builder/${s3_key}`)
 
             // if (!process.env.AWS_BUCKET_NAME) {
@@ -215,7 +283,7 @@ async function replaceUrls(
       }
     } else if (typeof obj[key] === 'object' && obj[key] !== null) {
       // replaceUrls(obj[key], oldDomain, newDomain)
-      urls = urls.concat(await replaceUrls(obj[key], oldDomain, newDomain));
+      urls = urls.concat(await replaceUrls(obj[key], oldDomain, newDomain, depth + 1));
     }
   }
 
@@ -258,6 +326,11 @@ export const pushToEnvironment = async (pageId?: string) => {
   const invalidationPaths: string[] = []
 
   for (const page of pages) {
+    if (!page) {
+      console.warn('Skipping null/undefined page');
+      continue;
+    }
+
     const symbols: any[] = [];
     const findSymbols = (blocks: any) => {
       if (Array.isArray(blocks)) {
@@ -304,19 +377,30 @@ export const pushToEnvironment = async (pageId?: string) => {
 
     // console.log('page:', JSON.stringify(page, null, 2))
 
-    const query = (page as any).query.find(
+    const query = (page as any).query?.find(
       (q: any) => q.property === 'urlPath',
     );
+    
+    if (!query) {
+      console.warn('No urlPath query found for page:', page.id || 'unknown');
+      continue;
+    }
+
     const queryValue = Array.isArray(query.value)
       ? query.value[0]
       : query.value;
-    const url = queryValue === '/' ? '/index' : queryValue;
+    // Ensure the URL is properly decoded to prevent %2F and other encoded characters
+    const decodedUrl = safeDecodePath(queryValue);
+    const url = decodedUrl === '/' ? '/index' : decodedUrl;
 
     const urlParts = url.split('/').filter((part: any) => part !== '');
 
-    const fileName = `${page?.data?.exportslug ? page.data.exportslug : urlParts[urlParts.length - 1]}.json`;
+    // Ensure all URL parts are properly decoded to prevent encoded characters in filenames
+    const decodedUrlParts = urlParts.map(part => safeDecodePath(part));
+    const baseFileName = page?.data?.exportslug ? page.data.exportslug : (decodedUrlParts.length > 0 ? decodedUrlParts[decodedUrlParts.length - 1] : 'index');
+    const fileName = `${sanitizeFilename(baseFileName)}.json`;
     const filePath =
-      urlParts.length > 1 ? `/${urlParts.slice(0, -1).join('/')}/` : '/';
+      decodedUrlParts.length > 1 ? `/${decodedUrlParts.slice(0, -1).join('/')}/` : '/';
 
     const s3_key = path.join('builder', 'pages', filePath, fileName);
 
@@ -335,6 +419,11 @@ export const pushToEnvironment = async (pageId?: string) => {
     }
 
     invalidationPaths.push(`/${s3_key}`);
+  }
+
+  if (invalidationPaths.length === 0) {
+    console.warn('No files to invalidate');
+    return;
   }
 
   const invalidationParams = {
