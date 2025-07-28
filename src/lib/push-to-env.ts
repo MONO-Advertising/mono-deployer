@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // import dotenv from 'dotenv';
 // dotenv.config();
 import path from 'path';
@@ -147,7 +148,6 @@ async function uploadAsset(url: string) {
 
   const responseUrl = new URL(`${publicDomain}/${s3_key}`);
   // responseUrl.search = urlObj.searchParams.toString();
-  // console.log('responseUrl:', responseUrl.href)
 
   try {
     await s3.upload(params).promise();
@@ -172,10 +172,10 @@ async function replaceUrls(
   depth: number = 0,
 ): Promise<string[]> {
   // Prevent infinite recursion
-  if (depth > 10) {
-    console.warn('Maximum recursion depth reached in replaceUrls');
-    return [];
-  }
+  // if (depth > 10) {
+  //   console.warn('Maximum recursion depth reached in replaceUrls');
+  //   return [];
+  // }
 
   const regex = /(http[s]?:\/\/[^\s\)]+)/g;
   let urls: string[] = [];
@@ -207,6 +207,7 @@ async function replaceUrls(
             }
 
             const extractedUrlObj = new URL(extractedUrl);
+            extractedUrlObj.searchParams.delete('width');
 
             // console.log('extractedUrlObj:', extractedUrlObj)
             // console.log('extractedUrlObj.searchParams:', extractedUrlObj.searchParams)
@@ -219,7 +220,7 @@ async function replaceUrls(
 
             let contentType: string | null = null;
             try {
-              const fetchResponse = await fetch(extractedUrl);
+              const fetchResponse = await fetch(extractedUrlObj.href);
               contentType = fetchResponse.headers.get('content-type')?.split(';')[0] || null;
             } catch (error) {
               console.error('Error fetching content type for:', extractedUrl, error);
