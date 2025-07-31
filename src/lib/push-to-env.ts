@@ -4,6 +4,7 @@
 import path from 'path';
 import { fetchEntries, fetchOneEntry } from '@builder.io/sdk-react';
 import * as AWS from 'aws-sdk';
+// import { existsSync, mkdirSync, writeFileSync } from 'fs';
 // import uniq from 'lodash/uniq'
 // import fetch from 'node-fetch'
 // import { fileTypeFromBuffer } from 'file-type'
@@ -120,12 +121,21 @@ async function uploadAsset(url: string) {
   const urlObj = new URL(url);
   // console.log('urlObj.searchParams:', urlObj.searchParams)
   // console.log('urlObj.search:', urlObj.search)
+  
+  // Ensure we have alt=media parameter to get the actual image content
+  if (!urlObj.searchParams.has('alt')) {
+    urlObj.searchParams.set('alt', 'media');
+  }
+  
+  // Use the original URL with token and apiKey for fetching
+  const fetchUrl = urlObj.href;
+  
   const fullPath = urlObj.pathname;
   // Ensure the pathname is properly decoded to prevent %2F and other encoded characters
   const decodedPath = safeDecodePath(fullPath);
   const noSlashFullPath = decodedPath.replace(/^\/+/, '');
 
-  const response = await fetch(`${urlObj.origin}${fullPath}`);
+  const response = await fetch(fetchUrl);
   if (!response.ok) {
     console.error(`Error fetching file from ${url}`);
     throw new Error(`Error fetching file from ${url}: ${response.status} ${response.statusText}`);
@@ -206,8 +216,24 @@ async function replaceUrls(
               continue;
             }
 
+            // Use the original encoded URL for fetching, but extract URL from decoded version for processing
+            const fetchUrlObj = new URL(match);
+            fetchUrlObj.searchParams.delete('width');
+
+            // Ensure we have alt=media parameter to get the actual image content
+            if (!fetchUrlObj.searchParams.has('alt')) {
+              fetchUrlObj.searchParams.set('alt', 'media');
+            }
+            
+            const fetchUrl = fetchUrlObj.href;
+
             const extractedUrlObj = new URL(extractedUrl);
             extractedUrlObj.searchParams.delete('width');
+
+            // Ensure we have alt=media parameter to get the actual image content
+            if (!extractedUrlObj.searchParams.has('alt')) {
+              extractedUrlObj.searchParams.set('alt', 'media');
+            }
 
             // console.log('extractedUrlObj:', extractedUrlObj)
             // console.log('extractedUrlObj.searchParams:', extractedUrlObj.searchParams)
@@ -220,8 +246,9 @@ async function replaceUrls(
 
             let contentType: string | null = null;
             try {
-              const fetchResponse = await fetch(extractedUrlObj.href);
+              const fetchResponse = await fetch(fetchUrl);
               contentType = fetchResponse.headers.get('content-type')?.split(';')[0] || null;
+
             } catch (error) {
               console.error('Error fetching content type for:', extractedUrl, error);
               continue;
@@ -235,8 +262,19 @@ async function replaceUrls(
               // console.log(`Skipping ${extractedUrl}. It is not an image or video`)
               continue;
             }
+            // Create a clean URL without token and apiKey for the final replacement
+            const cleanUrlObj = new URL(extractedUrl);
+            cleanUrlObj.searchParams.delete('width');
+            cleanUrlObj.searchParams.delete('token');
+            cleanUrlObj.searchParams.delete('apiKey');
+            
+            // Ensure we have alt=media parameter to get the actual image content
+            if (!cleanUrlObj.searchParams.has('alt')) {
+              cleanUrlObj.searchParams.set('alt', 'media');
+            }
+            
             // Ensure the pathname is properly decoded to prevent %2F and other encoded characters
-            const decodedPathname = safeDecodePath(extractedUrlObj.pathname);
+            const decodedPathname = safeDecodePath(cleanUrlObj.pathname);
             const s3_key = `${decodedPathname.replace(/^\/+/, '')}.${fileExtension}`;
             // console.log(`KEY: builder/${s3_key}`)
 
@@ -413,6 +451,13 @@ export const pushToEnvironment = async (pageId?: string) => {
         ContentType: 'application/json',
       };
       await s3.upload(params).promise();
+      // Save the page object to a JSON file locally for debugging or backup
+      // const outputDir = path.join(process.cwd(), '.builder-output');
+      // if (!existsSync(outputDir)) {
+      //   mkdirSync(outputDir, { recursive: true });
+      // }
+      // const localFilePath = path.join(outputDir, fileName);
+      // writeFileSync(localFilePath, JSON.stringify(page, null, 2), 'utf8');
       console.log(`Successfully uploaded file ${s3_key}`);
     } catch (err) {
       console.error('Error uploading file', err);
