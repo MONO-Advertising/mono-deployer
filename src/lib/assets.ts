@@ -1,7 +1,7 @@
 import { fetchAsset, readAsset, validateAssetUrl } from './asset-fetch';
 // import dotenv from 'dotenv';
 import path from 'path';
-import { S3Client, HeadObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, HeadObjectCommand, CopyObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 
 
@@ -219,112 +219,124 @@ async function fetchAllAssets(): Promise<AssetRow[]> {
 
 type UploadAssetResult = { key: string; url: string; didUpload: boolean };
 
+const ASSET_CONCURRENCY = 8;
+const DOWNLOAD_CONCURRENCY = 2;
+const MAX_INVENTORY_KEYS = 50_000;
+
+/** Bound memory and requests even if a provider returns malformed pagination. */
+async function existingAssetKeys(): Promise<Set<string>> {
+  const keys = new Set<string>();
+  const tokens = new Set<string>();
+  const Prefix = `${exportStorageConfig().prefix}/`;
+  let ContinuationToken: string | undefined;
+  for (let page = 0; page < 100; page++) {
+    const result = await s3.send(new ListObjectsV2Command({
+      Bucket: process.env.AWS_BUCKET_NAME!, Prefix, MaxKeys: 1000, ContinuationToken,
+    }));
+    for (const object of result.Contents || []) {
+      if (typeof object.Key !== 'string' || !object.Key.startsWith(Prefix)) throw new Error('Invalid S3 inventory key');
+      keys.add(object.Key);
+      if (keys.size > MAX_INVENTORY_KEYS) throw new Error('S3 inventory exceeds safe key limit');
+    }
+    if (!result.IsTruncated) return keys;
+    const next = result.NextContinuationToken;
+    if (!next || tokens.has(next)) throw new Error('Invalid S3 inventory pagination');
+    tokens.add(next);
+    ContinuationToken = next;
+  }
+  throw new Error('S3 inventory exceeds safe page limit');
+}
+
+/** The inventory is a positive cache, never proof that an object is absent. */
+async function objectExists(Key: string, inventory: Set<string>): Promise<boolean> {
+  if (inventory.has(Key)) return true;
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: process.env.AWS_BUCKET_NAME!, Key }));
+    inventory.add(Key);
+    return true;
+  } catch (error) {
+    if (!isS3NotFound(error)) throw error;
+    return false;
+  }
+}
+
+function boundedDownloads() {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async <T>(work: () => Promise<T>): Promise<T> => {
+    if (active >= DOWNLOAD_CONCURRENCY) await new Promise<void>(resolve => waiting.push(resolve));
+    else active++;
+    try { return await work(); }
+    finally {
+      const next = waiting.shift();
+      if (next) next(); // Transfer this slot directly to the next waiter.
+      else active--;
+    }
+  };
+}
+
 /** Live Builder bindings reach imgix with the original extensionless pathname. */
-async function ensureRawAssetAlias(assetUrl: URL, sourceKey: string): Promise<void> {
+async function ensureRawAssetAlias(assetUrl: URL, sourceKey: string, inventory: Set<string>): Promise<void> {
   const pathname = safeDecodePath(assetUrl.pathname).replace(/^\/+/, '');
   if (pathname.split('/').some(part => part === '.' || part === '..') || /[\\\x00-\x1f]/.test(pathname)) {
     throw new Error('Unsafe raw asset path');
   }
   const rawKey = `${exportStorageConfig().prefix}/${pathname}`;
-  if (rawKey === sourceKey) return;
+  if (rawKey === sourceKey || await objectExists(rawKey, inventory)) return;
   const Bucket = process.env.AWS_BUCKET_NAME!;
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket, Key: rawKey }));
-    return;
-  } catch (error) {
-    if (!isS3NotFound(error)) throw error;
-  }
   await s3.send(new CopyObjectCommand({ Bucket, Key: rawKey, CopySource: `${Bucket}/${encodeURIComponent(sourceKey)}` }));
+  inventory.add(rawKey);
 }
 
-
-async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
+async function uploadAssetToS3(asset: AssetRow, inventory: Set<string>, download: ReturnType<typeof boundedDownloads>): Promise<UploadAssetResult> {
   const publicDomain = exportStorageConfig().publicBaseUrl;
   const urlObj = validateAssetUrl(asset.url);
   const fetchUrl = urlObj.href;
-
   let headerContentType: string | null = null;
   const tentative = computeS3KeyParts(asset, urlObj, null);
   if (!tentative.ext) {
     try {
       const headRes = await fetchAsset(fetchUrl, 'HEAD');
-      if (headRes.ok) {
-        headerContentType = headRes.headers.get('content-type');
-      }
-    } catch {
-      // ignore
-    }
+      if (headRes.ok) headerContentType = headRes.headers.get('content-type');
+      await headRes.body?.cancel();
+    } catch { /* The guarded GET below can still determine content type. */ }
   }
-
   let parts = computeS3KeyParts(asset, urlObj, headerContentType);
-
-  const bucket = process.env.AWS_BUCKET_NAME!;
-
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
-    await ensureRawAssetAlias(urlObj, parts.s3Key);
-    return {
-      key: parts.s3Key,
-      url: `${publicDomain}/${parts.s3RelativeKey}`,
-      didUpload: false,
-    };
-  } catch (err: unknown) {
-    if (!isS3NotFound(err)) throw err;
-  }
-
-  const response = await fetchAsset(fetchUrl);
-  if (!response.ok) {
-    throw new Error(
-      `Error fetching file from ${asset.url}: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  const getHeader = response.headers.get('content-type');
-  parts = computeS3KeyParts(asset, urlObj, getHeader);
-  const contentType = normalizeContentType(asset.type, getHeader);
-
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
-    void response.body?.cancel();
-    await ensureRawAssetAlias(urlObj, parts.s3Key);
-    return {
-      key: parts.s3Key,
-      url: `${publicDomain}/${parts.s3RelativeKey}`,
-      didUpload: false,
-    };
-  } catch (err: unknown) {
-    if (!isS3NotFound(err)) throw err;
-  }
-
-  const fileBuffer = await readAsset(response);
-
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
-    await ensureRawAssetAlias(urlObj, parts.s3Key);
-    return {
-      key: parts.s3Key,
-      url: `${publicDomain}/${parts.s3RelativeKey}`,
-      didUpload: false,
-    };
-  } catch (err: unknown) {
-    if (!isS3NotFound(err)) throw err;
-  }
-
-  console.log('uploading file:', `${publicDomain}/${parts.s3RelativeKey}`);
-
-  await new Upload({ client: s3, params: {
-      Bucket: bucket,
-      Key: parts.s3Key,
-      Body: fileBuffer,
-      ContentType: contentType,
-    } }).done();
-
-  await ensureRawAssetAlias(urlObj, parts.s3Key);
-  return {
-    key: parts.s3Key,
-    url: `${publicDomain}/${parts.s3RelativeKey}`,
-    didUpload: true,
+  const existing = async (): Promise<UploadAssetResult | undefined> => {
+    if (!await objectExists(parts.s3Key, inventory)) return undefined;
+    await ensureRawAssetAlias(urlObj, parts.s3Key, inventory);
+    return { key: parts.s3Key, url: `${publicDomain}/${parts.s3RelativeKey}`, didUpload: false };
   };
+  const found = await existing();
+  if (found) return found;
+
+  // readAsset buffers at most 256 MiB. Keep the entire GET/read/upload lifetime
+  // inside two slots rather than allocating eight maximum-size buffers at once.
+  return download(async () => {
+    const queuedFound = await existing();
+    if (queuedFound) return queuedFound;
+    const response = await fetchAsset(fetchUrl);
+    try {
+      if (!response.ok) throw new Error(`Asset download failed (${response.status})`);
+      const getHeader = response.headers.get('content-type');
+      parts = computeS3KeyParts(asset, urlObj, getHeader);
+      const typedFound = await existing();
+      if (typedFound) return typedFound;
+      const fileBuffer = await readAsset(response);
+      const concurrentFound = await existing();
+      if (concurrentFound) return concurrentFound;
+      await new Upload({ client: s3, queueSize: 1, params: {
+        Bucket: process.env.AWS_BUCKET_NAME!, Key: parts.s3Key,
+        Body: fileBuffer, ContentType: normalizeContentType(asset.type, getHeader),
+      } }).done();
+      inventory.add(parts.s3Key);
+      await ensureRawAssetAlias(urlObj, parts.s3Key, inventory);
+      return { key: parts.s3Key, url: `${publicDomain}/${parts.s3RelativeKey}`, didUpload: true };
+    } finally {
+      // Cancel an unused GET body when another worker already uploaded its key.
+      try { await response.body?.cancel(); } catch { /* Already consumed/locked. */ }
+    }
+  });
 }
 
 export type PushAssetsResult = {
@@ -343,38 +355,44 @@ export type PushAssetsOptions = { onProgress?: (progress: AssetProgress) => Prom
 export const pushAssets = async (options: PushAssetsOptions = {}): Promise<PushAssetsResult> => {
   exportStorageConfig();
   const assets = await fetchAllAssets();
+  const inventory = await existingAssetKeys();
+  const download = boundedDownloads();
   const uploaded: PushAssetsResult['uploaded'] = [];
   const skipped: PushAssetsResult['skipped'] = [];
   const failed: PushAssetsResult['failed'] = [];
-  const reportProgress = async () => {
-    if (!options.onProgress) return;
-    try {
-      await options.onProgress({ total: assets.length, completed: uploaded.length + skipped.length + failed.length,
-        uploaded: uploaded.length, skipped: skipped.length, failed: failed.length });
-    } catch { console.warn('Asset progress reporting failed'); }
+  let progressTail = Promise.resolve();
+  const reportProgress = () => {
+    if (!options.onProgress) return Promise.resolve();
+    // Capture at completion time and serialize callbacks to prevent an older
+    // in-flight progress write from overwriting a newer count.
+    const snapshot = { total: assets.length, completed: uploaded.length + skipped.length + failed.length,
+      uploaded: uploaded.length, skipped: skipped.length, failed: failed.length };
+    progressTail = progressTail.then(async () => {
+      try { await options.onProgress!(snapshot); }
+      catch { console.warn('Asset progress reporting failed'); }
+    });
+    return progressTail;
   };
   await reportProgress();
 
-  for (const asset of assets) {
-    if (!asset.url) {
-      skipped.push({ id: asset.id, reason: 'missing url' });
-      await reportProgress();
-      continue;
-    }
-
-    try {
-      const { key, url, didUpload } = await uploadAssetToS3(asset);
-      if (didUpload) {
-        uploaded.push({ id: asset.id, key, url });
-      } else {
-        skipped.push({ id: asset.id, reason: 'already on s3' });
+  let cursor = 0;
+  const run = async () => {
+    while (cursor < assets.length) {
+      const asset = assets[cursor++];
+      if (!asset.url) skipped.push({ id: asset.id, reason: 'missing url' });
+      else {
+        try {
+          const { key, url, didUpload } = await uploadAssetToS3(asset, inventory, download);
+          if (didUpload) uploaded.push({ id: asset.id, key, url });
+          else skipped.push({ id: asset.id, reason: 'already on s3' });
+        } catch (error) {
+          failed.push({ id: asset.id, error: error instanceof Error ? error.message : String(error) });
+        }
       }
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      failed.push({ id: asset.id, error: message });
+      await reportProgress();
     }
-    await reportProgress();
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(ASSET_CONCURRENCY, assets.length) }, run));
 
   return { uploaded, skipped, failed };
 };
