@@ -16,7 +16,7 @@ function harness(options = {}) {
   let callbackFails=options.callbackFails || false;
   class QueryCommand {constructor(input){this.input=input;this.kind='query';}}
   class UpdateCommand {constructor(input){this.input=input;this.kind='update';}}
-  const env={JOBS_TABLE:'jobs',VERCEL_PROJECT_ID:'prj_fixture',VERCEL_TEAM_ID:'team_fixture',TRACKING_SECRET_ARN:'tracking',STATUS_SECRET_ARN:'status',BOT_STATUS_URL:'https://mono-deploy-bot-mono-web-resources.vercel.app/internal/publishing-status',...options.env};
+  const env={JOBS_TABLE:'jobs',VERCEL_PROJECT_ID:'prj_fixture',VERCEL_TEAM_ID:'team_fixture',TRACKING_SECRET_ARN:'tracking',STATUS_SECRET_ARN:'status',BOT_STATUS_URL:'https://mono-deploy-bot.vercel.app/internal/publishing-status',...options.env};
   const db={send:async command=>{
     calls.push([command.kind,command.input]);
     if(command.kind==='query') return {Items:job.monitorKey==='active'?[structuredClone(job)]:[]};
@@ -122,7 +122,7 @@ test('canonical alias must match before and after health, including production p
 });
 
 test('callback configuration cannot send signed payloads to another host or port',async()=>{
-  for(const endpoint of ['https://attacker.example/internal/publishing-status','https://mono-deploy-bot-mono-web-resources.vercel.app:444/internal/publishing-status']){
+  for(const endpoint of ['https://attacker.example/internal/publishing-status','https://mono-deploy-bot.vercel.app:444/internal/publishing-status']){
     const h=harness({env:{BOT_STATUS_URL:endpoint}});await h.run();assert.equal(callbacks(h).length,0);assert.equal(h.job.monitorKey,'active');assert.equal(h.job.notificationHash,undefined);
   }
 });

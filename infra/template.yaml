@@ -301,7 +301,7 @@ Resources:
           STATUS_SECRET_ARN: !Ref StatusSecret
           VERCEL_TEAM_ID: team_eoUs1hvwiD3xHSLonELDSUIv
           VERCEL_PROJECT_ID: prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv
-          BOT_STATUS_URL: https://mono-deploy-bot-mono-web-resources.vercel.app/internal/publishing-status
+          BOT_STATUS_URL: https://mono-deploy-bot.vercel.app/internal/publishing-status
       Policies:
         - Version: '2012-10-17'
           Statement:

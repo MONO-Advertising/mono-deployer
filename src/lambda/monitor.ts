@@ -8,7 +8,7 @@ const finished = new Set(['synced', 'live', 'failed', 'hook_unknown', 'attention
 const tracking = new Set(['deployment_requested', 'building', 'ready']);
 const publicFields = ['jobId', 'status', 'phase', 'createdAt', 'updatedAt', 'mode', 'deploymentId', 'deploymentUrl', 'assetTotal', 'assetCompleted', 'assetUploaded', 'assetSkipped', 'assetFailed', 'pageTotal', 'pageCompleted', 'missingAssetCount'];
 const healthUrl = 'https://www.mono-1.com/';
-const callbackHost = 'mono-deploy-bot-mono-web-resources.vercel.app';
+const callbackHost = 'mono-deploy-bot.vercel.app';
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 function snapshot(job: Job): Job {
   return Object.fromEntries(publicFields.filter(key => job[key] !== undefined).map(key => [key, job[key]]));
