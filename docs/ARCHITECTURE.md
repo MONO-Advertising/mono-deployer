@@ -17,9 +17,11 @@ Verified during this work:
 
 **A real production CMS export and end-to-end Slack-triggered deployment have not been exercised.** Normal production publishing is enabled, but acceptance, export completion, Vercel build completion, and successful production serving are distinct milestones.
 
-## Status-card upgrade: AWS deployed; bot promotion and schedule enablement pending
+## Status-card upgrade: live; dedicated rebuild verification pending
 
-The credential/runtime migration above is live. The newer progress counters, exact deployment tracking, monitor Lambda, index, and separated AWS secrets have been deployed. The one-minute schedule remains **disabled** pending promotion of bot PR 2, staged as `dpl_5hr8Xq38VRzPNXxSKTJaXjpVauCs`, and callback verification. Automatic live Slack progress is therefore not yet enabled at this checkpoint.
+The credential/runtime migration and status-card upgrade are live. Bot PR 2 merged at `92617d0`; production deployment `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj` is READY and serves patched Node 22.23.4. AWS is `UPDATE_COMPLETE` with `StatusEnabled=true`, so the one-minute monitor schedule is enabled.
+
+Callback verification against the configured monitor hostname returned 401 unsigned and 404 for a correctly signed unknown-job callback: signature authentication passed, but no job/destination was found. No Slack messages were sent by those probes. A dedicated API rebuild verification was accepted as deployment `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`, correlated to job `7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`. It is **BUILDING at this checkpoint**; completion and production-health verification remain pending. This dedicated test did not perform a CMS export.
 
 The bot adds **Publish + rebuild** and **Sync content only**, creates one persistent Slack status card before enqueueing, and sends its validated channel/message coordinates with the request. Repeated submissions reuse the persisted target; a duplicate provisional card can be removed after reconciling the original. The card displays elapsed time, asset totals/completed/uploaded/reused/failed, page totals/completed, missing-asset warnings, and the cache-invalidation/build phase. Its **Check status** button reads the job API without starting another publish; **View deployment** links to the recorded deployment when available. Status request failures are not reported as publishing failure.
 
@@ -41,7 +43,7 @@ Notifications go to the bot's `/internal/publishing-status` endpoint using a sep
 
 **Tracking credentials:** the installed `mono-publishing-status` Vercel token was verified as scoped only to website project `mono-dotcom` (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored as `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation` (`TrackingSecret`), readable by the worker and monitor. The monitor's secret permissions cover only `TrackingSecret` and the callback-signing `StatusSecret`; it cannot read the Builder private key in `PublishingSecret`. A mistakenly bot-scoped token was revoked.
 
-The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Remaining rollout gates are bot promotion, signed callback verification, and enabling `StatusEnabled`; a real user publish remains the final integrated behavioral check.
+The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Bot promotion, signed callback authentication checks, and `StatusEnabled` enablement are complete. The dedicated API rebuild still needs completion/production-health verification; a real user publish remains the final integrated behavioral check.
 
 ## Repository boundaries
 
@@ -72,7 +74,7 @@ flowchart LR
   API --> Ingress[Lambda ingress]
   Ingress --> Queue[SQS FIFO production group]
   Ingress <--> Jobs[DynamoDB job records]
-  Schedule[Minute schedule - currently disabled] --> Monitor[Status monitor Lambda]
+  Schedule[Minute schedule - enabled] --> Monitor[Status monitor Lambda]
   Monitor -->|active-job index| Jobs
   Monitor -->|exact deployment and production target| VercelAPI[Vercel API]
   Monitor -->|bounded public HTML check| Site
@@ -115,7 +117,7 @@ The nightly cron remains `0 6 * * *` (06:00 UTC), defined in the website's [Verc
 
 The website validates that its enqueue destination is HTTPS on an API Gateway hostname and refuses redirects. The bot requires HTTPS without embedded credentials, query, or fragment and also refuses redirects. Neither caller needs an AWS access key, Builder private key, or Vercel deploy-hook URL.
 
-The deployment UI and Slack say **queued**, not completed. The live migration baseline bot accepts HTTP 202 with a valid queued job response. A terminal duplicate from AWS is 409; the website translates recognized terminal duplicates into a truthful 200 status response. The pending bot upgrade also recognizes correlated 409 responses carrying the original Slack target and reconciles that existing card rather than claiming a fresh job.
+The deployment UI and Slack say **queued**, not completed. The live migration baseline bot accepts HTTP 202 with a valid queued job response. A terminal duplicate from AWS is 409; the website translates recognized terminal duplicates into a truthful 200 status response. The live status-card bot also recognizes correlated 409 responses carrying the original Slack target and reconciles that existing card rather than claiming a fresh job.
 
 Builder routing is in [publishing-client.ts](../../mono-dotcom/src/lib/publishing-client.ts): `page` syncs `newValue.id`; `news-tile`, `leadership-tile`, and `work-tile` map to fixed index-page IDs; `header`, `footer`, and `site` sync all pages. Unknown models return a no-op. Replacing index entries in Builder requires reviewing those mappings.
 
@@ -132,7 +134,7 @@ sequenceDiagram
   participant S as S3
   participant C as CloudFront
   participant V as Vercel
-  participant M as Status monitor - schedule disabled
+  participant M as Status monitor
   Caller->>API: Authenticated POST, payload, stable Idempotency-Key
   API->>DB: Read job and payload fingerprint
   API->>Q: Send durable message when new
@@ -155,7 +157,7 @@ sequenceDiagram
     W->>DB: deployment_requested with vercelJobId
   end
   Note over Caller,V: deployment_requested does not mean build ready or production healthy
-  Note over DB,V: AWS monitor deployed; schedule enablement follows bot promotion
+  Note over DB,V: AWS monitor and signed bot callback are enabled
   M->>DB: Read active job and recorded deployment ID
   M->>V: Verify exact deployment, production target, public HTML
   M->>DB: Conditionally record current state
@@ -200,7 +202,7 @@ stateDiagram-v2
   running --> hook_dispatching: deploy mode, record intent
   hook_dispatching --> deployment_requested: Vercel returns job ID
   hook_dispatching --> hook_unknown: timeout, error, or interrupted dispatch
-  deployment_requested --> building: monitor after schedule enablement
+  deployment_requested --> building: scheduled monitor
   building --> ready: exact deployment READY
   ready --> live: exact target and alias checks around HTML probe
   building --> failed: ERROR or CANCELED
@@ -217,7 +219,7 @@ stateDiagram-v2
 
 A failed pre-hook attempt sets `retry` and returns a partial batch failure. The queue has a 5,400-second visibility timeout, 14-day retention, and redrives after five receives. A stuck `running` attempt can be reclaimed after its lease expires. SQS visibility means retries may not be immediate. Job records expire through DynamoDB TTL after approximately 30 days; TTL removal is asynchronous. The table has point-in-time recovery and encryption enabled.
 
-`hook_unknown` is deliberately terminal: a network timeout can occur after Vercel accepted the hook. Redriving that job blindly could create another deployment. Inspect Vercel build history and the job record before deciding whether to issue a genuinely new request. The live migration baseline has no automatic completion callback. The deployed monitor implementation described above adds exact deployment/production verification before reporting `live` once its schedule is enabled; the worker still stops at request acceptance.
+`hook_unknown` is deliberately terminal: a network timeout can occur after Vercel accepted the hook. Redriving that job blindly could create another deployment. Inspect Vercel build history and the job record before deciding whether to issue a genuinely new request. The live migration baseline has no automatic completion callback. The deployed monitor implementation described above adds exact deployment/production verification before reporting `live` with its schedule enabled; the worker still stops at request acceptance.
 
 ## Export format and S3 key contract
 

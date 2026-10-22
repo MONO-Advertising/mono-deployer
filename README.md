@@ -92,9 +92,19 @@ not sufficient. Legacy hook jobs lacking an exact deployment ID cannot be
 reported live automatically. Tracking failures stay unknown/pending; unresolved
 jobs older than 24 hours need attention.
 
-AWS progress/monitor infrastructure is deployed, with the minute schedule still
-disabled. Bot PR 2 is staged as `dpl_5hr8Xq38VRzPNXxSKTJaXjpVauCs`, awaiting
-promotion and callback verification before `StatusEnabled=true`.
+AWS progress/monitor infrastructure is deployed (`UPDATE_COMPLETE`) and its
+minute schedule is enabled with `StatusEnabled=true`. Bot PR 2 merged at
+`92617d0`; production deployment `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj` is READY
+on Node 22.23.4. Unsigned callback requests returned 401; a correctly signed
+unknown-job callback returned 404 after authentication, without sending Slack
+messages.
+
+Dedicated API rebuild verification was accepted as deployment
+`dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G` and is still BUILDING at this checkpoint.
+Its correlated job is
+`7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`.
+This test performs no CMS export. Build completion and production-health
+verification remain pending; no real Slack publishing submission has been tested.
 
 The installed `mono-publishing-status` token is verified as scoped only to the
 `mono-dotcom` website project (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored
