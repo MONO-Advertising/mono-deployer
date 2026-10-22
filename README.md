@@ -100,11 +100,13 @@ unknown-job callback returned 404 after authentication, without sending Slack
 messages.
 
 Dedicated API rebuild verification was accepted as deployment
-`dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G` and is still BUILDING at this checkpoint.
+`dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G` and completed READY with production target.
 Its correlated job is
 `7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`.
-This test performs no CMS export. Build completion and production-health
-verification remain pending; no real Slack publishing submission has been tested.
+The scheduled monitor independently recorded `status=live`, `phase=live`, and
+`monitorCheckedAt=1792699571`, then removed `monitorKey`, confirming the exact
+deployment, production-alias, and HTML-health verification path. This test performed
+no CMS export; no real Slack publishing submission has been tested.
 
 The installed `mono-publishing-status` token is verified as scoped only to the
 `mono-dotcom` website project (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored

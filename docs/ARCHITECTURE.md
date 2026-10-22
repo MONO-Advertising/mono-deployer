@@ -4,7 +4,7 @@ Updated October 22, 2026. This document describes the migrated implementation an
 
 ## Deployment status and verification boundary
 
-The migrated website and Slack bot containers have now been promoted. The website deployment is `dpl_CwCumSTwy6AqQpyiCpLqpRr1b3KD`; the bot deployment is `dpl_5oYa5EqVKKHguW3Mx1KDwpoV1AGb`. Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
+The migrated website and Slack bot containers have now been promoted. The latest verified website deployment is `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`; the bot deployment is `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj`. Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
 
 Verified during this work:
 
@@ -17,11 +17,11 @@ Verified during this work:
 
 **A real production CMS export and end-to-end Slack-triggered deployment have not been exercised.** Normal production publishing is enabled, but acceptance, export completion, Vercel build completion, and successful production serving are distinct milestones.
 
-## Status-card upgrade: live; dedicated rebuild verification pending
+## Status-card upgrade: live and dedicated rebuild verified
 
 The credential/runtime migration and status-card upgrade are live. Bot PR 2 merged at `92617d0`; production deployment `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj` is READY and serves patched Node 22.23.4. AWS is `UPDATE_COMPLETE` with `StatusEnabled=true`, so the one-minute monitor schedule is enabled.
 
-Callback verification against the configured monitor hostname returned 401 unsigned and 404 for a correctly signed unknown-job callback: signature authentication passed, but no job/destination was found. No Slack messages were sent by those probes. A dedicated API rebuild verification was accepted as deployment `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`, correlated to job `7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`. It is **BUILDING at this checkpoint**; completion and production-health verification remain pending. This dedicated test did not perform a CMS export.
+Callback verification against the configured monitor hostname returned 401 unsigned and 404 for a correctly signed unknown-job callback: signature authentication passed, but no job/destination was found. No Slack messages were sent by those probes. A dedicated API rebuild verification was accepted as deployment `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`, correlated to job `7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`. It completed **READY with production target**. The scheduled monitor independently recorded `status=live`, `phase=live`, and `monitorCheckedAt=1792699571`, then removed `monitorKey` from the completed job. This verifies the exact-deployment/production-alias/HTML-health path through the scheduled monitor. This dedicated test did not perform a CMS export or send a real Slack publishing submission.
 
 The bot adds **Publish + rebuild** and **Sync content only**, creates one persistent Slack status card before enqueueing, and sends its validated channel/message coordinates with the request. Repeated submissions reuse the persisted target; a duplicate provisional card can be removed after reconciling the original. The card displays elapsed time, asset totals/completed/uploaded/reused/failed, page totals/completed, missing-asset warnings, and the cache-invalidation/build phase. Its **Check status** button reads the job API without starting another publish; **View deployment** links to the recorded deployment when available. Status request failures are not reported as publishing failure.
 
@@ -43,7 +43,7 @@ Notifications go to the bot's `/internal/publishing-status` endpoint using a sep
 
 **Tracking credentials:** the installed `mono-publishing-status` Vercel token was verified as scoped only to website project `mono-dotcom` (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored as `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation` (`TrackingSecret`), readable by the worker and monitor. The monitor's secret permissions cover only `TrackingSecret` and the callback-signing `StatusSecret`; it cannot read the Builder private key in `PublishingSecret`. A mistakenly bot-scoped token was revoked.
 
-The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Bot promotion, signed callback authentication checks, and `StatusEnabled` enablement are complete. The dedicated API rebuild still needs completion/production-health verification; a real user publish remains the final integrated behavioral check.
+The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Bot promotion, signed callback authentication checks, and `StatusEnabled` enablement are complete. The dedicated API rebuild and scheduled production-health verification succeeded; a real Slack-driven publish including a production CMS export remains the untested integrated path.
 
 ## Repository boundaries
 
