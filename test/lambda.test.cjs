@@ -142,6 +142,13 @@ test('direct validation reports asset failures and skips page export',async()=>{
   const h=harness({failedAssets:['broken']});const result=await h.load('worker').handler({validate:true},context);
   assert.equal(result.failedAssets,1);assert.equal(result.assetCount,1);assert.deepEqual(h.calls.map(c=>c[0]),['assets']);assert.equal(h.env.S3_KEY_PREFIX,undefined);
 });
+test('direct validation rejects traversal identifiers before export or changing its storage prefix',async()=>{
+  for (const validationId of ['../outside','../../pages','%2e%2e%2foutside','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/../../pages','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\\outside']) {
+    const h=harness({env:{PUBLISH_ENABLED:'false'}});
+    await assert.rejects(h.load('worker').handler({validate:true,validationId},context),/Invalid validation ID/);
+    assert.equal(h.calls.length,0);assert.equal(h.env.S3_KEY_PREFIX,undefined);assert.equal(h.env.PUBLIC_ASSET_BASE_URL,undefined);
+  }
+});
 test('ingress conditional-write race rejects different persisted request fingerprint',async()=>{
   let reads=0;
   const h=harness({prior:()=>++reads===1?undefined:{requestHash:'different'},dbError:Object.assign(Error('raced'),{name:'ConditionalCheckFailedException'})});

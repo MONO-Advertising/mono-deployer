@@ -11,9 +11,17 @@ has succeeded. Existing S3/CloudFront content remains the serving path.
 The initial managed Lambda Node runtime failed the minimum patched-version guard.
 A checksum-verified official Node 22.23.4 Linux arm64 interpreter layer is deployed
 through `AWS_LAMBDA_EXEC_WRAPPER`. A live worker health check confirmed Node
-22.23.4 and both publishing credentials ready. An isolated full export is being
-validated before opening the publishing gates.
-The guard remains enabled.
+22.23.4 and both publishing credentials ready. The isolated full-export asset
+phase completed, but page export failed on an asset-metadata request; diagnosis
+is ongoing. No complete export has been validated and publishing gates remain
+closed. The runtime guard remains enabled.
+
+Vercel runtime checks found Node 22.23.2 on its Node 22 runtime and 24.21.0 on
+its Node 24 runtime, both below the relevant patched release even when the build
+used patched Node. A patched Node 22.23.4 container fallback using
+`Dockerfile.vercel` is being tested for both applications. No fallback deployment
+has been promoted. Deployer pull request #2 exists; it is not evidence of a merge
+or completed production cutover.
 
 The new ingress endpoint and authentication key have been installed in both
 Vercel projects' environment configurations for all environments. Those changes
@@ -149,6 +157,43 @@ Account: 150101466270. Retired principal: `mono-website-builder`.
   management-event history does not cover S3 object access. Access logs and object
   version changes still need investigation; this review gives no clean bill of health.
 
+## Bounded S3 access-log follow-up
+
+Verified logging destination:
+`s3://monoweblogs/s3-access-logs/mono-website-assets/` in us-east-2.
+Read 165 small log objects containing 178 records, totaling 110,142 bytes, in
+memory only. No raw logs, request URLs, or credentials were printed or retained.
+All records parsed successfully. The sample used six delivery-hour prefixes:
+October 21 at 21:00 and 22:00 UTC, and October 22 at 06:00, 07:00, 15:00, and
+16:00 UTC, with at most 30 or 40 objects read per prefix.
+
+The sample contained 132 GET-object requests, 45 HEAD-object requests, and one
+HEAD-bucket request. Across all operations, status counts were 98 HTTP 200,
+38 HTTP 304, 31 HTTP 403, ten HTTP 404, and one HTTP 400. No PUT or DELETE
+appeared in this sample.
+
+Forty-five records explicitly identified `mono-website-builder`: 40 object HEAD
+requests returning 200 and five returning 404. Forty-four of those records were
+in the October 22 sample whose actual request times span 06:00:52–06:18:01 UTC;
+one was in the October 21 sample spanning 21:04:27–21:58:46 UTC. Those are the
+containing sample windows, not exact bounds for every attributed request.
+The pattern is consistent with the application's existence checks but does not
+establish whether requests were legitimate. Attribution to the IAM user is
+practical; proving caller intent requires correlation with IPs, user agents, and
+known publishing activity.
+
+Four of the six hourly listings were truncated at the imposed limit. Selection
+was bounded and nonrandom, not a complete incident-window scan. Delivery prefixes
+lag actual request times; the other sample windows covered October 21
+20:17:01–20:59:25 UTC and October 22 05:01:36–05:56:12,
+13:10:06–14:58:48, and 15:03:33–15:49:27 UTC. S3 server access logging is also
+best effort and can be delayed, incomplete, or duplicated. These findings cannot
+exclude abuse or substitute for a broader requester-filtered investigation.
+
+Sources:
+- https://docs.aws.amazon.com/AmazonS3/latest/userguide/LogFormat.html
+- https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html
+
 ## Advisory references
 
 Node's October 21 security release addresses high-severity issues, including
@@ -178,15 +223,16 @@ Architecture references:
 
 ## Remaining cutover gates and limitations
 
-1. Finish deploying the interpreter layer and verify both functions execute the
-   patched runtime with all pause gates still closed.
-2. Confirm exposed Builder-key revocation; verify AWS publishing secrets and
-   ingress authentication without logging values.
-3. Run a representative export against an isolated prefix; verify asset references,
-   page count, bindings, output contents, and duration within Lambda's 15-minute
-   ceiling. Split/checkpoint jobs if the full workload approaches that ceiling.
-4. Complete website dependency/build review and deploy the updated bot and website.
-   Verify their live routes and new authentication, not just saved environments.
+1. Retain the verified Node 22.23.4 Lambda layer and runtime gate; verify ingress
+   execution and authentication with all publishing gates still closed.
+2. Preserve verified old Builder-key rejection and publishing-secret readiness;
+   finish inventorying any other consumers without exposing credential values.
+3. Diagnose the isolated page-export asset-metadata failure and rerun the full
+   export. Verify asset references, page count, bindings, output contents, and
+   duration within Lambda's 15-minute ceiling. Split/checkpoint jobs if needed.
+4. Complete container-fallback testing for the bot and website, prove the actual
+   execution runtime is patched, and verify routes and authentication before
+   any production promotion. A successful build or saved environment is insufficient.
 5. Enable publishing/queue consumption deliberately, observe a full job through
    CloudFront and Vercel production readiness, and test job-status/error handling.
 6. Confirm old Railway integrations cannot resume publishing; finish retiring the

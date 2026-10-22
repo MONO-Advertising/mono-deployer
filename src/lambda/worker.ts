@@ -49,7 +49,9 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
     if (!paths) {
       const assets = await pushAssets();
       if (assets.failed.length) throw new Error('Asset export failed');
-      ({ paths } = await pushToEnvironment(pageId, { invalidate: false }));
+      const exported = await pushToEnvironment(pageId, { invalidate: false });
+      paths = exported.paths;
+      if (exported.missingAssets?.length) await update({ missingAssetCount: exported.missingAssets.length });
       if (!paths.length) throw new Error('No published pages exported');
       await update({ paths, updatedAt: Math.floor(Date.now()/1000) });
     }
@@ -84,7 +86,7 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
   }
 }
 
-export async function handler(event: SQSEvent | { healthcheck: true } | { validate: true }, context: Context) {
+export async function handler(event: SQSEvent | { healthcheck: true } | { validate: true; validationId?: string }, context: Context) {
   requirePatchedNode();
   if ('healthcheck' in event && event.healthcheck === true) {
     let secretsReady = false;
@@ -93,7 +95,9 @@ export async function handler(event: SQSEvent | { healthcheck: true } | { valida
   }
   if ('validate' in event && event.validate === true) {
     await publishingSecrets();
-    const prefix = `builder/validation/${randomUUID()}`;
+    const validationId = event.validationId || randomUUID();
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(validationId)) throw new Error('Invalid validation ID');
+    const prefix = `builder/validation/${validationId}`;
     process.env.S3_KEY_PREFIX = prefix;
     process.env.PUBLIC_ASSET_BASE_URL = `https://d1ttqs35fxgawv.cloudfront.net/${prefix}`;
     const start = Date.now();
@@ -102,8 +106,8 @@ export async function handler(event: SQSEvent | { healthcheck: true } | { valida
       const { pushToEnvironment } = await import('../lib/push-to-env');
       const assets = await pushAssets();
       if (assets.failed.length) return { runtime:process.versions.node, prefix, assetCount:assets.uploaded.length+assets.skipped.length+assets.failed.length, failedAssets:assets.failed.length, elapsedSeconds:(Date.now()-start)/1000 };
-      const { paths } = await pushToEnvironment(undefined,{invalidate:false});
-      return { runtime:process.versions.node, prefix, assetCount:assets.uploaded.length+assets.skipped.length, pageCount:paths.length, failedAssets:0, elapsedSeconds:(Date.now()-start)/1000 };
+      const { paths, missingAssets } = await pushToEnvironment(undefined,{invalidate:false});
+      return { runtime:process.versions.node, prefix, assetCount:assets.uploaded.length+assets.skipped.length, pageCount:paths.length, missingAssets:missingAssets || [], failedAssets:0, elapsedSeconds:(Date.now()-start)/1000 };
     } finally {
       delete process.env.S3_KEY_PREFIX;
       delete process.env.PUBLIC_ASSET_BASE_URL;

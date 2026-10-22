@@ -23,7 +23,7 @@ function sanitizeFilename(value: string): string {
 }
 
 // Asset upload and page references must use exactly the same key algorithm.
-async function replaceUrls(obj: any, cache: Map<string, string>): Promise<void> {
+async function replaceUrls(obj: any, cache: Map<string, string>, missingAssets: Set<string>): Promise<void> {
   for (const key of Object.keys(obj)) {
     if (['workTile', 'workTile2', 'newsTile'].includes(key)) continue;
     if (typeof obj[key] === 'string') {
@@ -36,20 +36,28 @@ async function replaceUrls(obj: any, cache: Map<string, string>): Promise<void> 
           url.searchParams.delete('width');
           url.searchParams.delete('alt');
           const response = await fetchAsset(url.href, 'HEAD');
-          if (!response.ok) throw new Error('Asset metadata request failed');
+          if (response.status === 404) {
+            // A deleted upstream image already referenced by a page must not become
+            // a fabricated S3 URL. Preserve its original reference and report it.
+            missingAssets.add(url.pathname);
+            console.warn(JSON.stringify({ event: 'missing_source_asset', path: url.pathname }));
+            cache.set(match, match);
+            continue;
+          }
+          if (!response.ok) throw new Error(`Asset metadata request failed (${response.status}) for ${url.pathname}`);
           const parts = computeS3KeyParts({ id: 'asset', name: null, type: null, url: url.href }, url, response.headers.get('content-type'));
           cache.set(match, `${exportStorageConfig().publicBaseUrl}/${parts.s3RelativeKey}`);
         }
         obj[key] = obj[key].replace(match, cache.get(match)!);
       }
     } else if (obj[key] && typeof obj[key] === 'object') {
-      await replaceUrls(obj[key], cache);
+      await replaceUrls(obj[key], cache, missingAssets);
     }
   }
 }
 
 export type ExportOptions = { invalidate?: boolean; callerReference?: string };
-export const pushToEnvironment = async (pageId?: string, options: ExportOptions = {}): Promise<{ paths: string[] }> => {
+export const pushToEnvironment = async (pageId?: string, options: ExportOptions = {}): Promise<{ paths: string[]; missingAssets: string[] }> => {
   const storage = exportStorageConfig();
   const apiKey = process.env.NEXT_PUBLIC_BUILDER_API_KEY;
   if (!apiKey || !process.env.AWS_BUCKET_NAME || !process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID) {
@@ -74,6 +82,7 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
   }
   const paths: string[] = [];
   const assetUrlCache = new Map<string, string>();
+  const missingAssets = new Set<string>();
   for (const page of pages) {
     // Match the website exporter: hydrated state must not freeze saved data bindings.
     const bindingUrl = new URL('https://cdn.builder.io/api/v3/content/page');
@@ -106,7 +115,7 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       if (!content?.data?.blocks) throw new Error('Referenced symbol is missing published blocks');
       parent.splice(parent.indexOf(symbol), 1, ...content.data.blocks);
     }
-    await replaceUrls(page, assetUrlCache);
+    await replaceUrls(page, assetUrlCache, missingAssets);
     const query = page.query?.find((q: any) => q.property === 'urlPath');
     if (!query) continue;
     const rawPath = Array.isArray(query.value) ? query.value[0] : query.value;
@@ -132,5 +141,5 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID, Id: result.Invalidation.Id,
     });
   }
-  return { paths: uniquePaths };
+  return { paths: uniquePaths, missingAssets: [...missingAssets] };
 };

@@ -25,7 +25,8 @@ webhook secret stays separate in the website's `BUILDER_WEBHOOK_SECRET`.
 Never commit secrets or place fresh credentials in Railway.
 
 Run direct IAM-authorized worker events `{"healthcheck":true}` and
-`{"validate":true}` before enabling. Validation writes only to a new
+`{"validate":true}` before enabling. A retry may pass `validationId` with the
+UUID of its existing isolated test prefix; arbitrary prefixes are rejected. Validation writes only to a new
 `builder/validation/<uuid>/` prefix and does not invalidate production or invoke
 Vercel. Enable the queue and application gate only after validation and caller
 cutover. Keep the Vercel deploy-hook branch current with the migrated source.
@@ -48,7 +49,10 @@ failures are caught by the DLQ alarm, not the Lambda Errors metric alone.
 
 Only HTTPS `cdn.builder.io` assets are fetched, without redirects. Downloads have
 a 60-second deadline and a 256 MiB limit. Published pages are paginated and asset
-keys preserve canonical and extensionless aliases. Exports write the current
+keys preserve canonical and extensionless aliases. A deleted upstream image
+referenced only by page content stays at its original URL and is reported in
+`missingAssets`/job `missingAssetCount`; registered asset download failures still
+stop publishing. Exports write the current
 prefix in place; they are not atomic releases. S3 versioning supports recovery.
 
 The Express entry point remains for local development, not Lambda production.

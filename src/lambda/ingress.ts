@@ -18,7 +18,7 @@ export async function handler(event: APIGatewayProxyEventV2) {
       const id = event.pathParameters?.jobId || '';
       if (!/^[a-f0-9]{64}$/.test(id)) return reply(400, { error: 'Invalid job ID' });
       const job = await getJob(id);
-      return job ? reply(200, { jobId: id, status: job.status, updatedAt: job.updatedAt, vercelJobId: job.vercelJobId }) : reply(404, { error: 'Job not found' });
+      return job ? reply(200, { jobId: id, status: job.status, updatedAt: job.updatedAt, vercelJobId: job.vercelJobId, missingAssetCount: job.missingAssetCount }) : reply(404, { error: 'Job not found' });
     }
     if (event.requestContext.http.method !== 'POST' || event.rawPath !== '/api/deploy') return reply(404, { error: 'Not found' });
     if (process.env.PUBLISH_ENABLED !== 'true') return reply(503, { error: 'Publishing is paused' });

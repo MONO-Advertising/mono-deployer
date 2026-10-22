@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const { createRequire } = require('node:module');
 
 // Exercise the real exporter logic with all provider I/O replaced by local fixtures.
-function harness(pages, assets = [], environment = {}) {
+function harness(pages, assets = [], environment = {}, providers = {}) {
   const uploads = [];
   const copies = [];
   const pageRequests = [];
@@ -46,7 +46,7 @@ function harness(pages, assets = [], environment = {}) {
         if (url.origin !== 'https://cdn.builder.io') throw new Error('Invalid asset origin');
         return url;
       },
-      fetchAsset: async () => new Response('fixture-image', { headers: { 'content-type': 'image/png' } }),
+      fetchAsset: providers.fetchAsset || (async () => new Response('fixture-image', { headers: { 'content-type': 'image/png' } })),
       readAsset: async response => Buffer.from(await response.arrayBuffer()),
     },
   };
@@ -162,4 +162,50 @@ test('asset mirroring preserves raw extensionless aliases for live imgix binding
   assert.equal(h.copies.length, 1);
   assert.equal(h.copies[0].Key, 'builder/validation/aliases/api/v1/image/assets/space/asset-id');
   assert.equal(decodeURIComponent(h.copies[0].CopySource), 'fixture-bucket/' + h.uploads[0].Key);
+});
+
+test('missing page-only asset preserves original Builder URL and reports its path without fabricating S3 references', async () => {
+  const url = 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fdeleted.png?width=640&alt=media&token=fixture';
+  const requests = [];
+  const h = harness([page('home', url), page('second', url)], [], {}, {
+    fetchAsset: async (value, method) => {
+      requests.push({ value, method });
+      return new Response(null, { status: 404 });
+    },
+  });
+  const result = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false });
+  assert.equal(result.paths.length, 2);
+  assert.deepEqual(Array.from(result.missingAssets), [new URL(url).pathname]);
+  assert.equal(requests.length, 1, 'duplicate missing reference is checked only once');
+  assert.equal(requests[0].method, 'HEAD');
+  for (const upload of h.uploads) {
+    assert.equal(upload.ContentType, 'application/json');
+    assert.equal(JSON.parse(upload.Body).data.image, url);
+    assert.ok(!upload.Body.includes('cloudfront.net'), 'missing source must not become a fabricated mirror link');
+  }
+});
+
+test('non-404 page asset metadata errors fail export before page upload', async () => {
+  const url = 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fphoto.png';
+  for (const status of [403, 429, 500, 503]) {
+    const h = harness([page('home', url)], [], {}, {
+      fetchAsset: async () => new Response(null, { status }),
+    });
+    await assert.rejects(h.load('push-to-env').pushToEnvironment(), new RegExp(`Asset metadata request failed \\(${status}\\)`));
+    assert.equal(h.uploads.length, 0);
+  }
+});
+
+test('registered asset download 404 remains a hard failure instead of a skipped missing page reference', async () => {
+  const url = 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fregistered.png';
+  const h = harness([], [{ id: 'registered', name: 'registered', url, type: 'image/png' }], {}, {
+    fetchAsset: async () => new Response(null, { status: 404 }),
+  });
+  const result = await h.load('assets').pushAssets();
+  assert.equal(result.failed.length, 1);
+  assert.equal(result.failed[0].id, 'registered');
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.uploaded.length, 0);
+  assert.equal(h.uploads.length, 0);
+  assert.equal(h.copies.length, 0);
 });
