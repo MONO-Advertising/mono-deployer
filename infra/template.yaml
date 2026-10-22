@@ -3,6 +3,11 @@ Transform: AWS::Serverless-2016-10-31
 Description: Queued MONO publishing service; deploy as mono-deployer-production in us-east-2.
 
 Parameters:
+  StatusEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable durable status checks after the signed bot callback is deployed.
   WorkerEnabled:
     Type: String
     Default: 'false'
@@ -29,6 +34,7 @@ Parameters:
     Description: Optional existing SNS topic ARN for alarms; no subscription is created.
 
 Conditions:
+  MonitorEnabled: !Equals [!Ref StatusEnabled, 'true']
   ConsumeQueue: !Equals [!Ref WorkerEnabled, 'true']
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
 
@@ -78,6 +84,26 @@ Resources:
       Description: Rotated Builder private key and Vercel deploy hook; populate before enabling.
       SecretString: '{}'
 
+  TrackingSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: mono-deployer/production/vercel-automation
+      Description: Project-scoped Vercel deployment creation and status credential.
+      SecretString: '{}'
+
+  StatusSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: mono-deployer/production/status-signing
+      Description: HMAC key for updating existing Slack cards through the bot.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
   JobsTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -87,6 +113,15 @@ Resources:
       AttributeDefinitions:
         - AttributeName: jobId
           AttributeType: S
+        - AttributeName: monitorKey
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: MonitorIndex
+          KeySchema:
+            - AttributeName: monitorKey
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
       KeySchema:
         - AttributeName: jobId
           KeyType: HASH
@@ -212,6 +247,10 @@ Resources:
       ReservedConcurrentExecutions: 2
       Environment:
         Variables:
+          VERCEL_TEAM_ID: team_eoUs1hvwiD3xHSLonELDSUIv
+          VERCEL_PROJECT_ID: prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv
+          TRACKING_SECRET_ARN: !Ref TrackingSecret
+          VERCEL_GITHUB_REPO_ID: '884439367'
           QUEUE_URL: !Ref PublishingQueue
           PUBLISHING_SECRET_ARN: !Ref PublishingSecret
           AWS_BUCKET_NAME: !Ref AssetsBucketName
@@ -228,7 +267,7 @@ Resources:
               Resource: !GetAtt JobsTable.Arn
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref PublishingSecret
+              Resource: [!Ref PublishingSecret, !Ref TrackingSecret]
             - Effect: Allow
               Action: [s3:GetObject, s3:PutObject, s3:AbortMultipartUpload]
               Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/builder/*'
@@ -247,6 +286,55 @@ Resources:
             BatchSize: 1
             Enabled: !If [ConsumeQueue, true, false]
             FunctionResponseTypes: [ReportBatchItemFailures]
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-status'
+      Handler: monitor.handler
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          TRACKING_SECRET_ARN: !Ref TrackingSecret
+          STATUS_SECRET_ARN: !Ref StatusSecret
+          VERCEL_TEAM_ID: team_eoUs1hvwiD3xHSLonELDSUIv
+          VERCEL_PROJECT_ID: prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv
+          BOT_STATUS_URL: https://mono-deploy-bot-mono-web-resources.vercel.app/internal/publishing-status
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub '${JobsTable.Arn}/index/MonitorIndex'
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt JobsTable.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: [!Ref TrackingSecret, !Ref StatusSecret]
+  StatusSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: !If [MonitorEnabled, ENABLED, DISABLED]
+      Targets:
+        - Arn: !GetAtt StatusFunction.Arn
+          Id: StatusMonitor
+  StatusSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StatusFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StatusSchedule.Arn
+
+  StatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-status'
+      RetentionInDays: 30
 
   IngressLogGroup:
     Type: AWS::Logs::LogGroup
@@ -313,3 +401,9 @@ Outputs:
     Value: !Ref DeadLetterQueue
   JobsTableName:
     Value: !Ref JobsTable
+
+  StatusSecretArn:
+    Value: !Ref StatusSecret
+
+  TrackingSecretArn:
+    Value: !Ref TrackingSecret

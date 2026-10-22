@@ -56,7 +56,13 @@ async function replaceUrls(obj: any, cache: Map<string, string>, missingAssets: 
   }
 }
 
-export type ExportOptions = { invalidate?: boolean; callerReference?: string };
+export type PageProgress = { total: number; completed: number };
+// Called after enumeration and each processed item; callers own throttling/timeouts.
+// Awaited for ordering, but telemetry failures must never abort publishing.
+export type ExportOptions = {
+  invalidate?: boolean; callerReference?: string;
+  onProgress?: (progress: PageProgress) => Promise<void> | void;
+};
 export const pushToEnvironment = async (pageId?: string, options: ExportOptions = {}): Promise<{ paths: string[]; missingAssets: string[] }> => {
   const storage = exportStorageConfig();
   const apiKey = process.env.NEXT_PUBLIC_BUILDER_API_KEY;
@@ -80,6 +86,13 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       if (batch.length < 100) break;
     }
   }
+  let completed = 0;
+  const reportProgress = async () => {
+    if (!options.onProgress) return;
+    try { await options.onProgress({ total: pages.length, completed }); }
+    catch { console.warn('Page progress reporting failed'); }
+  };
+  await reportProgress();
   const paths: string[] = [];
   const assetUrlCache = new Map<string, string>();
   const missingAssets = new Set<string>();
@@ -117,7 +130,11 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
     }
     await replaceUrls(page, assetUrlCache, missingAssets);
     const query = page.query?.find((q: any) => q.property === 'urlPath');
-    if (!query) continue;
+    if (!query) {
+      completed++;
+      await reportProgress();
+      continue;
+    }
     const rawPath = Array.isArray(query.value) ? query.value[0] : query.value;
     if (typeof rawPath !== 'string') throw new Error('Invalid published page URL path');
     const decoded = safeDecodePath(rawPath);
@@ -129,6 +146,8 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       Bucket: process.env.AWS_BUCKET_NAME, Key: s3Key, Body: JSON.stringify(page, null, 2), ContentType: 'application/json',
     } }).done();
     paths.push('/' + s3Key);
+    completed++;
+    await reportProgress();
   }
   const uniquePaths = [...new Set(paths)];
   if (options.invalidate !== false && uniquePaths.length) {
