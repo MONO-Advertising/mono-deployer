@@ -4,7 +4,7 @@ Updated October 22, 2026. This document describes the migrated implementation an
 
 ## Deployment status and verification boundary
 
-The migrated website and Slack bot containers have now been promoted. The latest verified website deployment is `dpl_AaYHfsfo6R9rvYVNHCunhCy95roX`; the bot deployment is `dpl_2qJaSAqazabUV9hJHud378Gngtqg` (production alias verified). Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
+The migrated website and Slack bot containers have now been promoted. The latest verified website deployment is `dpl_4nmqBfBNemgxhC2jD4htfbxzGKQ8` (website PR 19, public HTML caching; see [Cache and freshness boundaries](#cache-and-freshness-boundaries)), replacing `dpl_AaYHfsfo6R9rvYVNHCunhCy95roX`, which remains its rollback target; the bot deployment is `dpl_2qJaSAqazabUV9hJHud378Gngtqg` (production alias verified). Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
 
 Verified during this work:
 
@@ -49,7 +49,7 @@ The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC)
 
 ## When to publish, sync, or rebuild
 
-Normal copy, image, and layout edits using existing components should be published in Builder. The authenticated Builder webhook is designed to enqueue **sync only**: a page event selects its page ID, known tile models refresh their mapped index page, and header/footer/site changes refresh all pages; unknown models do no work. After S3 export and CloudFront invalidation, ordinary CMS changes do not require a Vercel rebuild: the website reads page content with `no-store` and renders its catch-all route dynamically. We verified real Slack publishing end to end, but have **not verified a real Builder publish event's delivery or the webhook configuration in Builder's portal**.
+Normal copy, image, and layout edits using existing components should be published in Builder. The authenticated Builder webhook is designed to enqueue **sync only**: a page event selects its page ID, known tile models refresh their mapped index page, and header/footer/site changes refresh all pages; unknown models do no work. After S3 export and CloudFront invalidation, ordinary CMS changes do not require a Vercel rebuild: the website reads page content with `no-store` and renders its catch-all route dynamically. Vercel's CDN then shares each public page for up to 60 seconds, so a sync reaches visitors within about a minute of invalidation; **Publish + rebuild** starts with an empty cache, and `vercel cache invalidate --tag public-html` refreshes immediately. We verified real Slack publishing end to end, but have **not verified a real Builder publish event's delivery or the webhook configuration in Builder's portal**.
 
 | Action | When to use it |
 | --- | --- |
@@ -104,7 +104,8 @@ flowchart LR
   Worker -->|deploy jobs only| Hook[Vercel API or legacy deploy hook]
   Hook --> Build[Website build from configured Git branch]
   Build --> Site
-  Browser[Public visitor] --> Site
+  Browser[Public visitor] --> Edge[Vercel firewall and CDN cache]
+  Edge -->|cache miss| Site
   Site -->|page JSON reads| CF
   CF --> S3
   Browser --> Imgix[Imgix image transforms]
@@ -262,7 +263,9 @@ Exports update the production prefix **in place**, not as an atomic release. A m
 
 ## Public rendering and Builder editing
 
-The [catch-all page](../../mono-dotcom/src/app/[[...slug]]/page.tsx) is force-dynamic. With `STATIC_CONTENT_URL` configured and outside Builder editing, [get-content.ts](../../mono-dotcom/src/lib/get-content.ts) fetches page JSON from CloudFront using `cache: 'no-store'`. This disables Next's fetch cache for that read; CloudFront can still cache the object until invalidated.
+The [catch-all page](../../mono-dotcom/src/app/[[...slug]]/page.tsx) is force-dynamic. With `STATIC_CONTENT_URL` configured and outside Builder editing, [get-content.ts](../../mono-dotcom/src/lib/get-content.ts) fetches page JSON from CloudFront using `cache: 'no-store'`. This disables Next's fetch cache for that read; CloudFront can still cache the object until invalidated. Missing snapshots return a real 404 with Builder's not-found page.
+
+Next marks that route `private, no-cache, no-store`, so the container entry wraps Next's standalone server with [public-html-cache.cjs](../../mono-dotcom/server/public-html-cache.cjs). After the final status and headers are known, it adds `Vercel-CDN-Cache-Control: max-age=60` and `Vercel-Cache-Tag: public-html` only to production `200` HTML `GET`s of page-like paths on `www.mono-1.com` (or the deployment's own URL). Queries (including all Builder preview/editing parameters), cookies, `Authorization`, RSC/prefetch/router requests, other hosts (`preview.`, `stage.`, aliases), APIs, `/deploy`, labs, framework internals, file paths, non-200s, non-HTML, and `Set-Cookie` responses bypass. Each HTML response reports `X-Mono-Html-Cache: shared; max-age=60` or `bypass; reason=…`. Vercel's cache key ignores cookies, so cookie-bearing visitors can receive the shared anonymous page; only cookie-free renders are stored. The Vercel Firewall evaluates requests before the cache. Policy, measurements, and rollback: [public HTML cache](../../mono-dotcom/docs/public-html-cache-2026-10-22.md).
 
 Builder editing uses live Content API reads and Builder-aware search parameters so draft/preview content is not confused with a published snapshot. The public Builder key identifies the space and is intentionally usable in browser code; it does not grant the private management capabilities of `BUILDER_PRIVATE_KEY`.
 
@@ -305,7 +308,8 @@ The website's [playback-info endpoint](../../mono-dotcom/src/app/api/mux/playbac
 | S3 pages and assets | Persistent objects; exporter writes current prefix | Export or explicit version recovery |
 | CloudFront JSON | CDN in front of page objects | Worker waits for targeted page-path invalidation |
 | Imgix images | Transformed variants over configured origin | Provider cache policy/purge or changed URL; separate from CloudFront |
-| Next public page rendering | Force-dynamic; static JSON fetch uses no-store | Each render, subject to upstream CDN freshness |
+| Vercel CDN public HTML | Eligible anonymous pages shared 60 seconds per region and deployment; tag `public-html` | Expiry, new deployment, or `vercel cache invalidate --tag public-html` |
+| Next public page rendering | Force-dynamic; static JSON fetch uses no-store; runs only on CDN misses | Each render, subject to upstream CDN freshness |
 | Work Tile bindings | Builder CDN 30-second freshness/stale settings; no Next fetch caching | Subsequent render and Builder CDN expiry |
 | Mux metadata | Next unstable_cache, one hour; response max-age 300 / s-maxage 3600 | Cache expiry; container instances maintain separate local cache |
 | Mux video/thumbnails | Mux delivery and browser caches | Provider policy, reference/default changes, cache expiry |
