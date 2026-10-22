@@ -17,6 +17,32 @@ Verified during this work:
 
 **A real production CMS export and end-to-end Slack-triggered deployment have not been exercised.** Normal production publishing is enabled, but acceptance, export completion, Vercel build completion, and successful production serving are distinct milestones.
 
+## Status-card upgrade: AWS deployed; bot promotion and schedule enablement pending
+
+The credential/runtime migration above is live. The newer progress counters, exact deployment tracking, monitor Lambda, index, and separated AWS secrets have been deployed. The one-minute schedule remains **disabled** pending promotion of bot PR 2, staged as `dpl_5hr8Xq38VRzPNXxSKTJaXjpVauCs`, and callback verification. Automatic live Slack progress is therefore not yet enabled at this checkpoint.
+
+The bot adds **Publish + rebuild** and **Sync content only**, creates one persistent Slack status card before enqueueing, and sends its validated channel/message coordinates with the request. Repeated submissions reuse the persisted target; a duplicate provisional card can be removed after reconciling the original. The card displays elapsed time, asset totals/completed/uploaded/reused/failed, page totals/completed, missing-asset warnings, and the cache-invalidation/build phase. Its **Check status** button reads the job API without starting another publish; **View deployment** links to the recorded deployment when available. Status request failures are not reported as publishing failure.
+
+The worker's numeric-only progress callbacks report after enumeration and each processed item. Database updates are throttled to roughly five seconds, with final counters always attempted. Callback failures do not abort the export. Page completion counts processed pages, including entries skipped for having no routable URL; it is not an uploaded-object count.
+
+[monitor.ts](../src/lambda/monitor.ts) adds a separate short-running Lambda scheduled approximately once per minute. It queries active jobs through DynamoDB's sparse `MonitorIndex` (`monitorKey=active`) rather than scanning all job history. Conditional writes compare the observed status and update timestamp so a stale monitor observation does not overwrite a newer worker state. Changed snapshots update the existing Slack card; unchanged snapshots do not produce repeated messages. Delivery failures retain monitoring state for retry. Terminal jobs leave the active index after notification is acknowledged, or immediately if there is no Slack destination. The schedule is controlled independently by `StatusEnabled`, initially false.
+
+With `VERCEL_API_TOKEN` configured, the worker creates a production deployment through Vercel's API, passing the publishing job ID in `meta.publishingJobId` and recording the returned **exact deployment ID**. The monitor requires all of the following before reporting `live`:
+
+1. Vercel returns that exact deployment ID, expected project ID, production target, and matching publishing-job metadata.
+2. Its state is `READY`.
+3. The project's actual production target points to that deployment ID, and the canonical `www.mono-1.com` alias belongs to the expected project and exact deployment, without a redirect or deletion marker.
+4. The canonical website homepage returns a successful HTML response containing an HTML marker; redirects are rejected.
+5. Both the production pointer and exact canonical alias are checked **again after the HTTP probe**, preventing a concurrent promotion from being mistaken for this job's successful release.
+
+A ready but unpromoted deployment stays `ready` / `awaiting_promotion`; a failing homepage check stays pending. Provider/API errors are logged as tracking unavailable rather than invented success. Canceled/failed builds become `failed`; unresolved jobs older than 24 hours become `attention_required`. The HTML probe is a bounded availability check, not visual testing, asset coverage, or proof that every CMS page is correct. The legacy deploy-hook path remains compatible, but without an exact deployment ID the monitor cannot infer completion from a nearby build or a working homepage.
+
+Notifications go to the bot's `/internal/publishing-status` endpoint using a separate HMAC-SHA256 signature over `timestamp + '.' + raw JSON body`. The bot uses `BOT_STATUS_SIGNING_SECRET`, rejects timestamps outside a five-minute window, caps bodies at 16 KiB, validates the destination and job fields, and updates the existing Slack message. This credential is distinct from Slack's own `SLACK_SIGNING_SECRET` and from the publishing ingress key. The callback carries only a status allowlist and destination, not Builder credentials, raw export paths, request fingerprints, or Vercel tokens.
+
+**Tracking credentials:** the installed `mono-publishing-status` Vercel token was verified as scoped only to website project `mono-dotcom` (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored as `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation` (`TrackingSecret`), readable by the worker and monitor. The monitor's secret permissions cover only `TrackingSecret` and the callback-signing `StatusSecret`; it cannot read the Builder private key in `PublishingSecret`. A mistakenly bot-scoped token was revoked.
+
+The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Remaining rollout gates are bot promotion, signed callback verification, and enabling `StatusEnabled`; a real user publish remains the final integrated behavioral check.
+
 ## Repository boundaries
 
 Paths below assume the repositories retain their current sibling layout.
@@ -46,6 +72,11 @@ flowchart LR
   API --> Ingress[Lambda ingress]
   Ingress --> Queue[SQS FIFO production group]
   Ingress <--> Jobs[DynamoDB job records]
+  Schedule[Minute schedule - currently disabled] --> Monitor[Status monitor Lambda]
+  Monitor -->|active-job index| Jobs
+  Monitor -->|exact deployment and production target| VercelAPI[Vercel API]
+  Monitor -->|bounded public HTML check| Site
+  Monitor -->|signed status callback| Bot
   Queue --> Worker[Lambda publisher]
   Queue -->|retry exhaustion| DLQ[Dead-letter FIFO queue]
   Worker <--> Jobs
@@ -54,7 +85,7 @@ flowchart LR
   Builder -->|published pages and asset catalog| Worker
   Worker -->|objects and page JSON| S3[S3 assets bucket]
   Worker -->|invalidate and wait| CF[CloudFront]
-  Worker -->|deploy jobs only| Hook[Vercel deploy hook]
+  Worker -->|deploy jobs only| Hook[Vercel API or legacy deploy hook]
   Hook --> Build[Website build from configured Git branch]
   Build --> Site
   Browser[Public visitor] --> Site
@@ -84,7 +115,7 @@ The nightly cron remains `0 6 * * *` (06:00 UTC), defined in the website's [Verc
 
 The website validates that its enqueue destination is HTTPS on an API Gateway hostname and refuses redirects. The bot requires HTTPS without embedded credentials, query, or fragment and also refuses redirects. Neither caller needs an AWS access key, Builder private key, or Vercel deploy-hook URL.
 
-The deployment UI and Slack say **queued**, not completed. The bot accepts only HTTP 202 with a valid queued job response. A terminal duplicate from AWS is 409; the website translates recognized terminal duplicates into a truthful 200 status response, while the bot reports non-202 as not accepted rather than claiming a fresh job.
+The deployment UI and Slack say **queued**, not completed. The live migration baseline bot accepts HTTP 202 with a valid queued job response. A terminal duplicate from AWS is 409; the website translates recognized terminal duplicates into a truthful 200 status response. The pending bot upgrade also recognizes correlated 409 responses carrying the original Slack target and reconciles that existing card rather than claiming a fresh job.
 
 Builder routing is in [publishing-client.ts](../../mono-dotcom/src/lib/publishing-client.ts): `page` syncs `newValue.id`; `news-tile`, `leadership-tile`, and `work-tile` map to fixed index-page IDs; `header`, `footer`, and `site` sync all pages. Unknown models return a no-op. Replacing index entries in Builder requires reviewing those mappings.
 
@@ -101,6 +132,7 @@ sequenceDiagram
   participant S as S3
   participant C as CloudFront
   participant V as Vercel
+  participant M as Status monitor - schedule disabled
   Caller->>API: Authenticated POST, payload, stable Idempotency-Key
   API->>DB: Read job and payload fingerprint
   API->>Q: Send durable message when new
@@ -123,6 +155,11 @@ sequenceDiagram
     W->>DB: deployment_requested with vercelJobId
   end
   Note over Caller,V: deployment_requested does not mean build ready or production healthy
+  Note over DB,V: AWS monitor deployed; schedule enablement follows bot promotion
+  M->>DB: Read active job and recorded deployment ID
+  M->>V: Verify exact deployment, production target, public HTML
+  M->>DB: Conditionally record current state
+  M-->>Caller: Signed bot callback updates existing Slack card
 ```
 
 The ingress hashes the idempotency key into a 64-character job ID, and separately hashes `{mode,pageId}`. Reusing a key with a different payload is rejected. Queue delivery is the acceptance boundary; a database record alone is not enough. SQS deduplication and DynamoDB conditional writes handle repeated submissions, while the FIFO group serializes production publishing. All current jobs use the single `production` group, even though the worker has reserved concurrency of two.
@@ -142,8 +179,11 @@ flowchart LR
   Snapshot --> Read[Next public render reads refreshed content]
   Explicit[Slack or deploy UI request] --> Deploy[Queue deploy job]
   Deploy --> Snapshot2[Export and wait for invalidation]
-  Snapshot2 --> Hook[Vercel deploy hook]
+  Snapshot2 --> Hook[Vercel API or legacy deploy hook]
   Hook --> VBuild
+  VBuild --> Tracking[Correlate exact deployment]
+  Tracking --> LiveCheck[Production target plus HTML health]
+  LiveCheck --> Card[Update existing Slack status card]
 ```
 
 A normal Builder webhook sync does not build website code. An explicit deploy request intentionally combines an export with a subsequent website build. Git-triggered builds and operator promotion are separate from content sync; inspect project configuration and the actual production target rather than assuming every ready build has been promoted.
@@ -160,7 +200,15 @@ stateDiagram-v2
   running --> hook_dispatching: deploy mode, record intent
   hook_dispatching --> deployment_requested: Vercel returns job ID
   hook_dispatching --> hook_unknown: timeout, error, or interrupted dispatch
-  deployment_requested --> [*]
+  deployment_requested --> building: monitor after schedule enablement
+  building --> ready: exact deployment READY
+  ready --> live: exact target and alias checks around HTML probe
+  building --> failed: ERROR or CANCELED
+  ready --> failed: later failure or cancellation
+  building --> attention_required: tracking unresolved after 24 hours
+  live --> [*]
+  failed --> [*]
+  attention_required --> [*]
   synced --> [*]
   hook_unknown --> [*]: stop automatic retry; operator reconciliation
 ```
@@ -169,7 +217,7 @@ stateDiagram-v2
 
 A failed pre-hook attempt sets `retry` and returns a partial batch failure. The queue has a 5,400-second visibility timeout, 14-day retention, and redrives after five receives. A stuck `running` attempt can be reclaimed after its lease expires. SQS visibility means retries may not be immediate. Job records expire through DynamoDB TTL after approximately 30 days; TTL removal is asynchronous. The table has point-in-time recovery and encryption enabled.
 
-`hook_unknown` is deliberately terminal: a network timeout can occur after Vercel accepted the hook. Redriving that job blindly could create another deployment. Inspect Vercel build history and the job record before deciding whether to issue a genuinely new request. There is no automatic callback that converts `deployment_requested` into “production deployed.”
+`hook_unknown` is deliberately terminal: a network timeout can occur after Vercel accepted the hook. Redriving that job blindly could create another deployment. Inspect Vercel build history and the job record before deciding whether to issue a genuinely new request. The live migration baseline has no automatic completion callback. The deployed monitor implementation described above adds exact deployment/production verification before reporting `live` once its schedule is enabled; the worker still stops at request acceptance.
 
 ## Export format and S3 key contract
 
@@ -249,6 +297,8 @@ A content-only `sync` job does not request a Vercel rebuild. A `deploy` job does
 | Location | Names / capabilities |
 | --- | --- |
 | AWS ingress secret | Raw shared authentication value in `mono-deployer/production/ingress`; function receives `INGRESS_SECRET_ARN` |
+| AWS tracking secret | `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation`; worker and monitor receive `TRACKING_SECRET_ARN`; project-only scope and annual expiry described above |
+| AWS status-signing secret | Separate HMAC credential in `mono-deployer/production/status-signing`; monitor receives `STATUS_SECRET_ARN`, bot uses `BOT_STATUS_SIGNING_SECRET` |
 | AWS publishing secret | JSON containing `BUILDER_PRIVATE_KEY` and `VERCEL_DEPLOY_WEBHOOK`; worker receives `PUBLISHING_SECRET_ARN` |
 | Website runtime | `DEPLOY_API_ENDPOINT`, `DEPLOYMENT_KEY`; separate `BUILDER_WEBHOOK_SECRET`, `CRON_SECRET`, `BASIC_AUTH_USER`, `BASIC_AUTH_PASSWORD`; Mux runtime credentials where used |
 | Bot runtime | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `DEPLOYMENT_PASSWORD`, `DEPLOY_API_ENDPOINT`, `DEPLOYMENT_KEY`; local Socket Mode additionally uses `SLACK_APP_TOKEN` |
@@ -293,6 +343,7 @@ To return to managed hosting later, first prove the **actual serving runtime** m
 | Slack behavior and retry semantics | [bot app](../../mono-deploy-bot/index.js), [deploy client](../../mono-deploy-bot/deploy-client.js), [bot README](../../mono-deploy-bot/README.md) |
 | Media playback and editor compatibility | [reference contract](../../mono-dotcom/docs/mux-reference-contract.md), [Mux parser](../../mono-dotcom/src/lib/mux-reference.ts), [image loaders](../../mono-dotcom/src/lib/loaders.ts) |
 | Media migration or archive work | [video migration workflow](../../mono-dotcom/docs/video-migration-workflow.md), [script guide](../../mono-dotcom/scripts/README.md); treat private reports as sensitive |
+| Status-card upgrade | [monitor](../src/lambda/monitor.ts), [bot card/signature handler](../../mono-deploy-bot/publishing-status.js), [Lambda behavior tests](../test/lambda.test.cjs); keep `StatusEnabled=false` until callback and scoped secrets are ready |
 | Runtime packaging | [Lambda bundler](../scripts/build-lambda.cjs), [runtime layer builder](../scripts/build-node-runtime.py), both Dockerfiles, website public-build shim |
 
 Use each repository's pinned Node/package-manager versions and frozen lockfile. The deployer README gives `pnpm test` and `pnpm build:lambda`; website tests and TypeScript checks are separate; bot tests mock network interactions. Do not exercise real Slack publishing, Builder writes, Vercel hooks, or S3 recovery simply to run a unit test. The legacy Express entry point and website offline export utilities are not substitutes for the production queue and have different locking/credential assumptions.

@@ -65,3 +65,46 @@ See [the architecture and operations guide](docs/ARCHITECTURE.md) for the
 website, Slack bot, Builder, image/video delivery, AWS publishing, trust boundaries,
 and recovery procedures. The security review records incident-specific evidence
 and verification limits.
+
+
+## Slack progress and exact deployment tracking — rollout checkpoint
+
+The upgrade maintains one Slack status card with **Publish + rebuild**
+and **Sync content only** actions, asset/page counts, cache/build phases, elapsed
+time, and a **Check status** button. The button reads status; it never starts a
+second publish. Numeric exporter callbacks are awaited, caller-throttled, and
+non-fatal if telemetry fails.
+
+A separate `monitor.handler` Lambda queries active jobs through `MonitorIndex` on
+a one-minute EventBridge schedule. `StatusEnabled` defaults to false. It sends
+changed snapshots to `/internal/publishing-status` on the bot, signed with a
+separate timestamped HMAC secret (`StatusSecret` / `BOT_STATUS_SIGNING_SECRET`).
+The bot verifies the raw body signature and five-minute timestamp window and
+updates the existing message. No Slack OAuth token is needed in the publisher.
+
+When a Vercel API token is available, the worker creates the website deployment
+with `meta.publishingJobId`, records its exact deployment ID, and leaves tracking
+to the monitor. “Published” requires the matching project/job/production deployment
+to be READY and both the project production target and canonical `www.mono-1.com`
+alias to point to that exact deployment. These references are checked before and
+after a successful bounded HTML check of the public homepage. A ready preview or healthy old site is
+not sufficient. Legacy hook jobs lacking an exact deployment ID cannot be
+reported live automatically. Tracking failures stay unknown/pending; unresolved
+jobs older than 24 hours need attention.
+
+AWS progress/monitor infrastructure is deployed, with the minute schedule still
+disabled. Bot PR 2 is staged as `dpl_5hr8Xq38VRzPNXxSKTJaXjpVauCs`, awaiting
+promotion and callback verification before `StatusEnabled=true`.
+
+The installed `mono-publishing-status` token is verified as scoped only to the
+`mono-dotcom` website project (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored
+as `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation`
+(`TrackingSecret`). Worker and monitor read that separate secret; the monitor
+cannot read Builder credentials in `PublishingSecret`. The wrong bot-scoped token
+was revoked. The callback signing secret remains separate.
+
+The token expires October 22, 2027 at 20:54 America/Chicago (October 23 UTC).
+Renewal reminders exist for September 22 and October 15, 2027; they do not perform
+the rotation. Replace the scoped token before expiration and verify access to the
+intended website project. See [the architecture guide](docs/ARCHITECTURE.md) for
+the full state, verification limits, and trust model.
