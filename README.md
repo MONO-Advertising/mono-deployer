@@ -58,3 +58,10 @@ prefix in place; they are not atomic releases. S3 versioning supports recovery.
 The Express entry point remains for local development, not Lambda production.
 Copy `.env.example` privately to `.env` if using it. Its lock is process-local.
 See `SECURITY-REVIEW-2026-10-22.md` for incident findings and cutover status.
+
+## System documentation
+
+See [the architecture and operations guide](docs/ARCHITECTURE.md) for the
+website, Slack bot, Builder, image/video delivery, AWS publishing, trust boundaries,
+and recovery procedures. The security review records incident-specific evidence
+and verification limits.

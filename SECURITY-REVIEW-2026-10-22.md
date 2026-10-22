@@ -2,37 +2,50 @@
 
 ## Current operational state
 
-The Railway publisher has been stopped and automatic deployments disabled. The
-replacement AWS publishing infrastructure has been created in us-east-2, with
-publishing and queue consumption paused. Production cutover is not complete;
-no claim is made that the branches are merged or a complete production publish
-has succeeded. Existing S3/CloudFront content remains the serving path.
+The Railway publisher is stopped and automatic deployments are disabled. AWS
+publishing and queue consumption are enabled in `us-east-2`. Deployer PR #2 and
+website PR #18 are merged. The website's tested production container
+`dpl_CwCumSTwy6AqQpyiCpLqpRr1b3KD` has been promoted. Public homepage, work, and
+news routes return 200; unauthenticated publishing POSTs return 401; a signed
+Builder webhook with an unsupported model returns 200 without doing work.
+Bot PR #1 is merged and its tested production container
+`dpl_5oYa5EqVKKHguW3Mx1KDwpoV1AGb` is promoted. Its live Slack endpoint rejects
+unsigned requests with 401. A subsequent Git build may replace that deployment
+with the same runtime source.
+Both public website domains resolve to the promoted website deployment. The
+recent 15-minute error-log checks returned no entries for either promoted build.
+AWS final checks confirm active functions, enabled queue mapping, empty main and
+dead-letter queues, and the old IAM key still inactive. No real production content
+publish has been initiated during these checks.
 
-The initial managed Lambda Node runtime failed the minimum patched-version guard.
-A checksum-verified official Node 22.23.4 Linux arm64 interpreter layer is deployed
-through `AWS_LAMBDA_EXEC_WRAPPER`. A live worker health check confirmed Node
-22.23.4 and both publishing credentials ready. The isolated full-export asset
-phase completed, but page export failed on an asset-metadata request; diagnosis
-is ongoing. No complete export has been validated and publishing gates remain
-closed. The runtime guard remains enabled.
+The managed Lambda interpreter failed the minimum patched-version guard. A
+checksum-verified official Node 22.23.4 Linux ARM64 interpreter layer is deployed
+through `AWS_LAMBDA_EXEC_WRAPPER`; live health confirmed 22.23.4 and both provider
+credentials ready. Isolated export validated 1,155 assets and 61 pages with zero
+failed registered assets. A deleted page-only image remains at its original URL
+and is reported as missing; this pre-existing content defect does not fabricate a
+working mirrored URL. A warm retry completed in about 118 seconds; initial cold
+asset copying alone took about 652 seconds. All 2,412 versions under that isolated
+validation prefix were subsequently removed. Production objects were untouched.
+A synthetic terminal-job duplicate exercised HTTP authentication, durable status,
+and queue consumption without exporting content or triggering a Vercel hook.
 
-Vercel runtime checks found Node 22.23.2 on its Node 22 runtime and 24.21.0 on
-its Node 24 runtime, both below the relevant patched release even when the build
-used patched Node. A patched Node 22.23.4 container fallback using
-`Dockerfile.vercel` is being tested for both applications. No fallback deployment
-has been promoted. Deployer pull request #2 exists; it is not evidence of a merge
-or completed production cutover.
+Vercel runtime probes reported 22.23.2 on managed Node 22 and 24.21.0 on managed
+Node 24. No provider backport or mitigation has been verified. Both staged
+containers report Node 22.23.4. The user selected temporary patched containers on
+October 22, accepting approximately three extra minutes per website build
+(225 seconds measured versus about 40 seconds native). Return to managed Vercel
+only after its actual runtime patch status is verified. Container image pins and
+the Lambda interpreter layer require explicit maintenance for future patches.
 
-The new ingress endpoint and authentication key have been installed in both
-Vercel projects' environment configurations for all environments. Those changes
-apply to future deployments; they do not prove the existing live deployment has
-loaded the replacement values. Bot and website publishing source paths have been
-migrated locally to the queued AWS interface. Website production dependency audit reports zero findings; two build-tool
-advisories remain documented in its migration PR. Obsolete AWS keys, Builder
-private key, and Vercel hook have been removed from all website environments;
-only the Lambda worker needs the provider secrets. A read-only check of the
-previous Builder private key returned authentication errors, confirming it no
-longer authenticates. Thirty-four deployer tests pass on patched Node.
+Replacement ingress configuration is installed in both Vercel projects for all
+environments. Obsolete AWS credentials, Builder private key, and Vercel deploy hook
+have been removed from website environment configuration; provider secrets reside
+in AWS Secrets Manager. The previous Builder key fails authentication. Deployer
+and bot dependency audits report zero findings; website production dependencies
+report zero, with two development/build-tool advisories remaining. Tests passed:
+34 deployer, 78 website, and nine bot tests. These results do not establish that
+an attacker did not previously use the exposed credentials.
 
 ## Publishing architecture and security boundaries
 
@@ -84,8 +97,8 @@ compatibility with a deployed smoke invocation after each layer change.
 | AWS access-key pair | Exposed user's sole key is Inactive. No replacement pair created. Dedicated Lambda roles replace it. Delete the old key/user after evidence retention and dependency checks. |
 | `mono-website-builder` bucket-policy access | Removed from the live bucket policy. The applied semantic diff removes only this user's principal and preserves all other grants. |
 | Builder private key | Replacement validated and installed in AWS Secrets Manager. The previous key fails a read-only authenticated asset query; the new key succeeds. |
-| Deployment ingress key | New value in AWS and both Vercel projects' environment configurations for all environments. Complete/recheck deployments so live callers use it. Railway remains stopped. |
-| Builder webhook authentication secret | User rotated it; website environment configuration updated. Validate the new webhook path after website deployment. |
+| Deployment ingress key | New value in AWS and both Vercel projects' environment configurations for all environments. Website and bot promoted with replacement configuration. Railway remains stopped. |
+| Builder webhook authentication secret | User rotated it; website environment configuration updated. Signed no-op webhook verified on the live website; unknown requests return 401. |
 | Vercel deployment hook | Old hook revoked; replacement installed in AWS publishing secrets. |
 | Public Builder API key | Public content-Space identifier; retained. Review content permissions rather than treating it as an administrative secret. |
 | Bucket name / distribution ID / port | Configuration identifiers, not credentials; no credential rotation required. |
@@ -120,8 +133,8 @@ SAM lint and the interpreter-layer build checks pass. These local checks do not
 replace verifying the deployed runtime, end-to-end export duration, actual IAM
 permissions, live caller deployment, and Vercel production readiness.
 
-The bot and website active publishing paths have been migrated in source. Final
-website audit/build results remain pending. No PHP source or runtime configuration
+The bot and website active publishing paths have been migrated in source. Website production container build and public-route smoke checks pass; two
+development/build-tool advisories remain (braces and postcss-selector-parser). No PHP source or runtime configuration
 was found in the repositories inspected; unrelated PHP hosting remains out of scope.
 
 ## AWS exposure and investigation findings
