@@ -1,6 +1,11 @@
-/.git
-/node_modules
-.dockerignore
+.git
+node_modules
+dist
 .env
-Dockerfile
+.env.*
+!.env.example
+Dockerfile*
 fly.toml
+.secrets
+.aws-sam
+.vercel

@@ -1,7 +1,9 @@
+import { fetchAsset, readAsset, validateAssetUrl } from './asset-fetch';
 // import dotenv from 'dotenv';
 import path from 'path';
-import * as AWS from 'aws-sdk';
-import { createAdminApiClient } from '@builder.io/admin-sdk';
+import { S3Client, HeadObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+
 
 // dotenv.config();
 
@@ -9,22 +11,28 @@ if (!process.env.BUILDER_PRIVATE_KEY) {
   throw new Error('BUILDER_PRIVATE_KEY must be set');
 }
 
-if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-  throw new Error('AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set');
-}
 
 if (!process.env.AWS_BUCKET_NAME) {
   throw new Error('AWS_BUCKET_NAME must be set');
 }
 
-const adminSDK = createAdminApiClient(process.env.BUILDER_PRIVATE_KEY);
 
-const publicDomain = 'https://d1ttqs35fxgawv.cloudfront.net/builder';
 
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-});
+export function exportStorageConfig(): { prefix: string; publicBaseUrl: string } {
+  const prefix = process.env.S3_KEY_PREFIX || 'builder';
+  if (!/^builder(?:\/[A-Za-z0-9_-]+)*$/.test(prefix)) {
+    throw new Error('S3_KEY_PREFIX must be builder or a safe path beneath builder');
+  }
+  const publicBaseUrl = process.env.PUBLIC_ASSET_BASE_URL || `https://d1ttqs35fxgawv.cloudfront.net/${prefix}`;
+  const url = new URL(publicBaseUrl);
+  if (url.origin !== 'https://d1ttqs35fxgawv.cloudfront.net' || url.username || url.password || url.search || url.hash || url.pathname !== `/${prefix}`) {
+    throw new Error('PUBLIC_ASSET_BASE_URL must match the CloudFront domain and S3 prefix');
+  }
+  return { prefix, publicBaseUrl };
+}
+
+// Default credential chain supports short-lived IAM role credentials.
+const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-2' });
 
 function isS3NotFound(err: unknown): boolean {
   const e = err as { code?: string; statusCode?: number; name?: string };
@@ -32,6 +40,7 @@ function isS3NotFound(err: unknown): boolean {
     e.code === 'NotFound' ||
     e.code === 'NoSuchKey' ||
     e.name === 'NotFound' ||
+    (e as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404 ||
     e.statusCode === 404
   );
 }
@@ -113,7 +122,7 @@ type S3KeyParts = {
   ext: string;
 };
 
-function computeS3KeyParts(
+export function computeS3KeyParts(
   asset: AssetRow,
   urlObj: URL,
   headerContentType: string | null,
@@ -148,7 +157,7 @@ function computeS3KeyParts(
 
   const suffix = ext ? `.${ext}` : '';
   const s3RelativeKey = `${relative}${suffix}`;
-  const s3Key = `builder/${s3RelativeKey}`;
+  const s3Key = `${exportStorageConfig().prefix}/${s3RelativeKey}`;
 
   return { s3Key, s3RelativeKey, contentType, ext };
 }
@@ -180,17 +189,23 @@ async function fetchAllAssets(): Promise<AssetRow[]> {
       offset,
     };
 
-    const response = await adminSDK.query({
-      assets: [
-        { input },
-        {
-          id: true,
-          name: true,
-          url: true,
-          type: true,
-        },
-      ],
+    const result = await fetch('https://cdn.builder.io/api/v2/admin', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.BUILDER_PRIVATE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      redirect: 'error',
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({
+        query: `query { assets(input: { limit: ${input.limit}, offset: ${input.offset} }) { id name url type } }`,
+      }),
     });
+    if (!result.ok) throw new Error('Builder asset query failed');
+    const response = await result.json() as { errors?: unknown[]; data?: { assets?: AssetRow[] } };
+    if (response.errors?.length || !Array.isArray(response.data?.assets)) {
+      throw new Error('Invalid Builder asset response');
+    }
 
     const batch = assetsFromQueryResponse(response);
     if (batch.length === 0) break;
@@ -204,15 +219,35 @@ async function fetchAllAssets(): Promise<AssetRow[]> {
 
 type UploadAssetResult = { key: string; url: string; didUpload: boolean };
 
+/** Live Builder bindings reach imgix with the original extensionless pathname. */
+async function ensureRawAssetAlias(assetUrl: URL, sourceKey: string): Promise<void> {
+  const pathname = safeDecodePath(assetUrl.pathname).replace(/^\/+/, '');
+  if (pathname.split('/').some(part => part === '.' || part === '..') || /[\\\x00-\x1f]/.test(pathname)) {
+    throw new Error('Unsafe raw asset path');
+  }
+  const rawKey = `${exportStorageConfig().prefix}/${pathname}`;
+  if (rawKey === sourceKey) return;
+  const Bucket = process.env.AWS_BUCKET_NAME!;
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket, Key: rawKey }));
+    return;
+  } catch (error) {
+    if (!isS3NotFound(error)) throw error;
+  }
+  await s3.send(new CopyObjectCommand({ Bucket, Key: rawKey, CopySource: `${Bucket}/${encodeURIComponent(sourceKey)}` }));
+}
+
+
 async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
-  const urlObj = new URL(asset.url);
+  const publicDomain = exportStorageConfig().publicBaseUrl;
+  const urlObj = validateAssetUrl(asset.url);
   const fetchUrl = urlObj.href;
 
   let headerContentType: string | null = null;
   const tentative = computeS3KeyParts(asset, urlObj, null);
   if (!tentative.ext) {
     try {
-      const headRes = await fetch(fetchUrl, { method: 'HEAD' });
+      const headRes = await fetchAsset(fetchUrl, 'HEAD');
       if (headRes.ok) {
         headerContentType = headRes.headers.get('content-type');
       }
@@ -226,7 +261,8 @@ async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
   const bucket = process.env.AWS_BUCKET_NAME!;
 
   try {
-    await s3.headObject({ Bucket: bucket, Key: parts.s3Key }).promise();
+    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
+    await ensureRawAssetAlias(urlObj, parts.s3Key);
     return {
       key: parts.s3Key,
       url: `${publicDomain}/${parts.s3RelativeKey}`,
@@ -236,7 +272,7 @@ async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
     if (!isS3NotFound(err)) throw err;
   }
 
-  const response = await fetch(fetchUrl);
+  const response = await fetchAsset(fetchUrl);
   if (!response.ok) {
     throw new Error(
       `Error fetching file from ${asset.url}: ${response.status} ${response.statusText}`,
@@ -248,8 +284,9 @@ async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
   const contentType = normalizeContentType(asset.type, getHeader);
 
   try {
-    await s3.headObject({ Bucket: bucket, Key: parts.s3Key }).promise();
+    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
     void response.body?.cancel();
+    await ensureRawAssetAlias(urlObj, parts.s3Key);
     return {
       key: parts.s3Key,
       url: `${publicDomain}/${parts.s3RelativeKey}`,
@@ -259,11 +296,11 @@ async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
     if (!isS3NotFound(err)) throw err;
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  const fileBuffer = Buffer.from(arrayBuffer);
+  const fileBuffer = await readAsset(response);
 
   try {
-    await s3.headObject({ Bucket: bucket, Key: parts.s3Key }).promise();
+    await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: parts.s3Key }));
+    await ensureRawAssetAlias(urlObj, parts.s3Key);
     return {
       key: parts.s3Key,
       url: `${publicDomain}/${parts.s3RelativeKey}`,
@@ -275,15 +312,14 @@ async function uploadAssetToS3(asset: AssetRow): Promise<UploadAssetResult> {
 
   console.log('uploading file:', `${publicDomain}/${parts.s3RelativeKey}`);
 
-  await s3
-    .upload({
+  await new Upload({ client: s3, params: {
       Bucket: bucket,
       Key: parts.s3Key,
       Body: fileBuffer,
       ContentType: contentType,
-    })
-    .promise();
+    } }).done();
 
+  await ensureRawAssetAlias(urlObj, parts.s3Key);
   return {
     key: parts.s3Key,
     url: `${publicDomain}/${parts.s3RelativeKey}`,
@@ -298,6 +334,7 @@ export type PushAssetsResult = {
 };
 
 export const pushAssets = async (): Promise<PushAssetsResult> => {
+  exportStorageConfig();
   const assets = await fetchAllAssets();
   const uploaded: PushAssetsResult['uploaded'] = [];
   const skipped: PushAssetsResult['skipped'] = [];

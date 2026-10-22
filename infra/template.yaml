@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Queued MONO publishing service; deploy as mono-deployer-production in us-east-2.
+
+Parameters:
+  WorkerEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable queue consumption only after credentials and runtime are verified.
+  PublishEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Explicit application-level publishing gate for ingress and worker.
+  AssetsBucketName:
+    Type: String
+    Default: mono-website-assets
+  CloudFrontDistributionId:
+    Type: String
+    Default: E1S6IGPBXC7JNY
+  BuilderPublicApiKey:
+    Type: String
+    Default: 6a0347e22f184b03be8ca9afe8221cea
+    Description: Public Builder Space identifier, not a private credential.
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional existing SNS topic ARN for alarms; no subscription is created.
+
+Conditions:
+  ConsumeQueue: !Equals [!Ref WorkerEnabled, 'true']
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    CodeUri: ../build/lambda/
+    Layers: [!Ref PatchedNodeRuntime]
+    RuntimeManagementConfig:
+      UpdateRuntimeOn: Auto
+    Environment:
+      Variables:
+        JOBS_TABLE: !Ref JobsTable
+        PUBLISH_ENABLED: !Ref PublishEnabled
+        AWS_LAMBDA_EXEC_WRAPPER: /opt/bin/node-wrapper
+
+Resources:
+  # Remove this interpreter override once the managed runtime meets the patch gate.
+  # Auto runtime updates do not update the bundled interpreter in this layer.
+  PatchedNodeRuntime:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      Description: Official checksum-verified Node 22.23.4 Linux arm64 interpreter.
+      ContentUri: ../build/node-runtime/
+      CompatibleArchitectures: [arm64]
+      CompatibleRuntimes: [nodejs22.x]
+      RetentionPolicy: Delete
+
+  IngressSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: mono-deployer/production/ingress
+      Description: Authentication secret shared only with the publishing bot.
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  PublishingSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: mono-deployer/production/publishing
+      Description: Rotated Builder private key and Vercel deploy hook; populate before enabling.
+      SecretString: '{}'
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dead-letter.fifo'
+      FifoQueue: true
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-publishing.fifo'
+
+  PublishingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-publishing.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  PublishingQueueTransportPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref PublishingQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt PublishingQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  DeadLetterQueueTransportPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  PublishingApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+
+  IngressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingress'
+      Handler: ingress.handler
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref PublishingQueue
+          INGRESS_SECRET_ARN: !Ref IngressSecret
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt PublishingQueue.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt JobsTable.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref IngressSecret
+      Events:
+        Deploy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PublishingApi
+            Path: /api/deploy
+            Method: POST
+            PayloadFormatVersion: '2.0'
+        JobStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PublishingApi
+            Path: /api/jobs/{jobId}
+            Method: GET
+            PayloadFormatVersion: '2.0'
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Handler: worker.handler
+      Timeout: 900
+      MemorySize: 2048
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref PublishingQueue
+          PUBLISHING_SECRET_ARN: !Ref PublishingSecret
+          AWS_BUCKET_NAME: !Ref AssetsBucketName
+          AWS_CLOUDFRONT_DISTRIBUTION_ID: !Ref CloudFrontDistributionId
+          NEXT_PUBLIC_BUILDER_API_KEY: !Ref BuilderPublicApiKey
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+              Resource: !GetAtt PublishingQueue.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt JobsTable.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref PublishingSecret
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:AbortMultipartUpload]
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/builder/*'
+            # Missing-object HEAD needs ListBucket to return 404 rather than 403.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}'
+            - Effect: Allow
+              Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+              Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistributionId}'
+      Events:
+        PublishJobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PublishingQueue.Arn
+            BatchSize: 1
+            Enabled: !If [ConsumeQueue, true, false]
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  IngressLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingress'
+      RetentionInDays: 30
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 30
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Publishing jobs exhausted retries and need investigation.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Publishing worker invocation errors require investigation.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${PublishingApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  DeployEndpoint:
+    Value: !Sub 'https://${PublishingApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/deploy'
+  IngressFunctionName:
+    Value: !Ref IngressFunction
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+  IngressSecretArn:
+    Value: !Ref IngressSecret
+  PublishingSecretArn:
+    Value: !Ref PublishingSecret
+  QueueUrl:
+    Value: !Ref PublishingQueue
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  JobsTableName:
+    Value: !Ref JobsTable
