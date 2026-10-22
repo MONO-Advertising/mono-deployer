@@ -10,21 +10,21 @@ const fingerprint = (mode='deploy',pageId=undefined) => crypto.createHash('sha25
 const command = class { constructor(input) { this.input = input; } };
 function harness(options = {}) {
   const calls = [];
-  const env = { PUBLISH_ENABLED: 'true', JOBS_TABLE: 'jobs', QUEUE_URL: 'queue', INGRESS_SECRET_ARN: 'ingress', PUBLISHING_SECRET_ARN: 'publishing', AWS_CLOUDFRONT_DISTRIBUTION_ID: 'distribution', ...options.env };
+  const env = { PUBLISH_ENABLED: 'true', JOBS_TABLE: 'jobs', QUEUE_URL: 'queue', INGRESS_SECRET_ARN: 'ingress', PUBLISHING_SECRET_ARN: 'publishing', AWS_CLOUDFRONT_DISTRIBUTION_ID: 'distribution', VERCEL_TEAM_ID:'team_fixture', VERCEL_PROJECT_ID:'prj_fixture', VERCEL_GITHUB_REPO_ID:'12345', ...options.env };
   const common = {
     table:'jobs', requirePatchedNode() {},
-    terminalStatuses:new Set(['deployment_requested','hook_unknown','validated','synced']),
+    terminalStatuses:new Set(['deployment_requested','hook_unknown','validated','synced','ready','live','failed','attention_required']),
     getJob:async () => typeof options.prior === 'function' ? options.prior() : options.prior,
-    readSecret:async arn => arn === 'ingress' ? 'fixture-secret' : JSON.stringify({BUILDER_PRIVATE_KEY:'bpk-fixture',VERCEL_DEPLOY_WEBHOOK:'https://api.vercel.com/v1/integrations/deploy/fixture'}),
-    db:{send:async cmd => { calls.push(['db',cmd.input]); if (options.dbError) throw options.dbError; return {}; }}
+    readSecret:async arn => arn === 'ingress' ? 'fixture-secret' : JSON.stringify({BUILDER_PRIVATE_KEY:'bpk-fixture',VERCEL_DEPLOY_WEBHOOK:'https://api.vercel.com/v1/integrations/deploy/fixture',...options.publishingSecret}),
+    db:{send:async cmd => { calls.push(['db',cmd.input]); if (options.dbError) throw options.dbError; if (options.dbSend) return options.dbSend(cmd.input); return {}; }}
   };
   const mocks = {
     './common':common,
     '@aws-sdk/lib-dynamodb':{PutCommand:command,UpdateCommand:command},
     '@aws-sdk/client-sqs':{SendMessageCommand:command,SQSClient:class { async send(cmd) { calls.push(['sqs',cmd.input]); if (options.queueError) throw Error('queue unavailable'); return {}; } }},
     '@aws-sdk/client-cloudfront':{CreateInvalidationCommand:command,CloudFrontClient:class {async send(cmd) {calls.push(['cf',cmd.input]);return {Invalidation:{Id:'invalidation'}};}},waitUntilInvalidationCompleted:async()=>{calls.push(['wait']);}},
-    '../lib/assets':{pushAssets:async()=>{calls.push(['assets']);return {failed:options.failedAssets || [],uploaded:[],skipped:[]};}},
-    '../lib/push-to-env':{pushToEnvironment:async(pageId,config)=>{calls.push(['pages',pageId,config]);return {paths:['/builder/pages/home.json']};}}
+    '../lib/assets':{pushAssets:async(config)=>{calls.push(['assets']); for (const value of options.assetProgress || []) { try { await config?.onProgress?.(value); } catch {} } return {failed:options.failedAssets || [],uploaded:[],skipped:[]};}},
+    '../lib/push-to-env':{pushToEnvironment:async(pageId,config)=>{calls.push(['pages',pageId,config]); for (const value of options.pageProgress || []) { try { await config?.onProgress?.(value); } catch {} } return {paths:['/builder/pages/home.json']};}}
   };
   function load(name) {
     const filename=path.resolve(__dirname,'../dist/lambda',name+'.js');
@@ -32,7 +32,7 @@ function harness(options = {}) {
     vm.runInNewContext(fs.readFileSync(filename,'utf8'),{
       module,exports:module.exports,require:name=>mocks[name] || realRequire(name),
       process:{env,versions:{node:'22.23.4'}},URL,Buffer,AbortSignal,
-      console:{log(){},error(){}},fetch:async()=>{calls.push(['hook']);if(options.hookError)throw Error('timeout');return new Response(JSON.stringify({job:{id:'vercel-job'}}));}
+      console:{log(){},error(){},warn(){}},fetch:async(url,config)=>{calls.push(['hook',url,config]);if(options.hookError)throw Error('timeout');return new Response(JSON.stringify(options.fetchBody ?? {job:{id:'vercel-job'}}),{status:options.fetchStatus || 200});}
     },{filename});
     return module.exports;
   }
@@ -66,7 +66,7 @@ test('existing job retry never queues a duplicate',async()=>{
   const h=harness({prior:{status:'queued'}});assert.equal((await h.load('ingress').handler(event())).statusCode,202);assert.equal(h.calls.length,0);
 });
 test('worker terminal duplicate is acknowledged without provider writes or hook',async()=>{
-  for (const status of ['deployment_requested','hook_unknown','validated','synced']) {
+  for (const status of ['deployment_requested','hook_unknown','validated','synced','ready','live','failed','attention_required']) {
     const h=harness({prior:{status}});const result=await h.load('worker').handler(records,context);
     assert.equal(result.batchItemFailures.length,0);assert.equal(h.calls.length,0);
   }
@@ -79,7 +79,7 @@ test('worker interrupted hook dispatch becomes unknown and never resends hook',a
 test('failed asset export retries job without page export, invalidation or deploy hook',async()=>{
   const h=harness({failedAssets:['bad-asset']});const result=await h.load('worker').handler(records,context);
   assert.equal(result.batchItemFailures[0].itemIdentifier,'message');
-  assert.deepEqual(h.calls.map(c=>c[0]),['db','assets','db']);assert.ok(statuses(h).includes('retry'));
+  assert.deepEqual(h.calls.map(c=>c[0]),['db','db','assets','db']);assert.ok(statuses(h).includes('retry'));
 });
 test('hook timeout becomes terminal unknown rather than retrying deployment',async()=>{
   const h=harness({hookError:true});const result=await h.load('worker').handler(records,context);
@@ -94,7 +94,7 @@ test('worker rejects paused publishing and malformed job identities',async()=>{
   assert.equal(result.batchItemFailures[0].itemIdentifier,'bad');assert.equal(h.calls.length,0);
 });
 test('terminal ingress retries report conflict instead of falsely reporting queued',async()=>{
-  for (const status of ['deployment_requested','hook_unknown','validated','synced']) {
+  for (const status of ['deployment_requested','hook_unknown','validated','synced','ready','live','failed','attention_required']) {
     const h=harness({prior:{status}});const response=await h.load('ingress').handler(event());
     assert.equal(response.statusCode,409);assert.equal(JSON.parse(response.body).status,status);assert.equal(h.calls.length,0);
   }
@@ -164,4 +164,115 @@ test('worker claim atomically binds fingerprint to prevent read-write race',asyn
   const h=harness();await h.load('worker').handler(records,context);
   const claim=updates(h)[0];assert.match(claim.ConditionExpression,/requestHash = :requestHash/);
   assert.equal(claim.ExpressionAttributeValues[':requestHash'],fingerprint());
+});
+
+const fields = update => Object.fromEntries(Object.entries(update.ExpressionAttributeNames || {}).filter(([key])=>key.startsWith('#k')).map(([key,name])=>[name,update.ExpressionAttributeValues[key.replace('#k',':v')]]));
+const payloadRecord = payload => ({Records:[{messageId:'message',body:JSON.stringify({jobId:id,requestHash:fingerprint(),...payload})}]});
+
+test('Slack targets are validated before ingress queueing and worker claims',async()=>{
+  for (const slack of [null,{},[],{channel:'https://evil.example',ts:'1792687000.123456'}, {channel:'CABC',ts:'1.123456'}, {channel:'CABC',ts:'1792687000.123'}, {channel:123,ts:'1792687000.123456'}]) {
+    const h=harness();
+    assert.equal((await h.load('ingress').handler({...event(),body:JSON.stringify({slack})})).statusCode,400);
+    assert.equal(h.calls.length,0);
+    const result=await h.load('worker').handler(payloadRecord({slack}),context);
+    assert.equal(result.batchItemFailures.length,1);assert.equal(h.calls.length,0);
+  }
+});
+
+test('Slack target is persisted as channel and timestamp only, with original retry target authoritative',async()=>{
+  const slack={channel:'CABC',ts:'1792687000.123456',unexpected:'do-not-store'};
+  const h=harness(); const response=await h.load('ingress').handler({...event(),body:JSON.stringify({slack})});
+  assert.equal(response.statusCode,202);
+  const safe={channel:slack.channel,ts:slack.ts};
+  assert.deepEqual(JSON.parse(h.calls[0][1].MessageBody).slack,safe);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[1][1].Item.slack)),safe);
+  assert.deepEqual(JSON.parse(response.body).slack,safe);
+  const duplicate=harness({prior:{status:'running',requestHash:fingerprint(),slack:safe}});
+  const retried=await duplicate.load('ingress').handler({...event(),body:JSON.stringify({slack:{channel:'COTHER',ts:'1792687001.123456'}})});
+  assert.deepEqual(JSON.parse(retried.body).slack,safe);assert.equal(duplicate.calls.length,0);
+});
+
+test('status API exposes progress and exact deployment identity but no internal state or nested extras',async()=>{
+  const prior={status:'building',phase:'building',mode:'deploy',assetTotal:10,assetCompleted:10,pageTotal:2,pageCompleted:2,
+    deploymentId:'dpl_fixture',deploymentUrl:'https://fixture.vercel.app',slack:{channel:'CABC',ts:'1792687000.123456',token:'private'},
+    attempt:'private',requestHash:'private',paths:['private'],leaseUntil:123,monitorKey:'active',notificationHash:'private'};
+  const h=harness({prior});
+  const result=await h.load('ingress').handler({...event({},'GET'),pathParameters:{jobId:id},rawPath:'/api/jobs/'+id});
+  assert.equal(result.statusCode,200);
+  const body=JSON.parse(result.body);
+  assert.equal(body.assetCompleted,10);assert.equal(body.pageCompleted,2);assert.equal(body.deploymentId,'dpl_fixture');
+  for(const key of ['attempt','requestHash','paths','leaseUntil','monitorKey','notificationHash']) assert.equal(body[key],undefined);
+  assert.deepEqual(body.slack,{channel:'CABC',ts:'1792687000.123456'});
+  assert.equal(result.headers['cache-control'],'no-store');assert.equal(h.calls.length,0);
+});
+
+test('worker progress writes are throttled but final counters and phase boundaries persist',async()=>{
+  const h=harness({assetProgress:[
+    {total:2,completed:0,uploaded:0,skipped:0,failed:0},
+    {total:2,completed:1,uploaded:1,skipped:0,failed:0},
+    {total:2,completed:2,uploaded:1,skipped:1,failed:0},
+  ],pageProgress:[{total:1,completed:0},{total:1,completed:1}]});
+  await h.load('worker').handler(records,context);
+  const values=updates(h).map(fields);
+  const assets=values.filter(v=>v.assetTotal!==undefined);
+  assert.equal(assets.length,2);assert.equal(assets[0].assetCompleted,0);assert.equal(assets[1].assetCompleted,2);
+  assert.equal(assets[1].assetUploaded,1);assert.equal(assets[1].assetSkipped,1);assert.equal(assets[1].assetFailed,0);
+  assert.deepEqual(values.filter(v=>v.pageTotal!==undefined).map(v=>v.pageCompleted),[0,1]);
+  assert.ok(values.some(v=>v.phase==='invalidating'));
+  for(const update of updates(h).slice(1)) assert.equal(update.ConditionExpression,'attempt = :attempt');
+});
+
+test('Vercel API submission records only confirmed exact project deployment identity after invalidation',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},fetchBody:{id:'dpl_exact',projectId:'prj_fixture',url:'fixture.vercel.app'}});
+  const result=await h.load('worker').handler(records,context);assert.equal(result.batchItemFailures.length,0);
+  const hook=h.calls.find(c=>c[0]==='hook');assert.match(hook[1],/^https:\/\/api.vercel.com\/v13\/deployments\?teamId=team_fixture$/);
+  const request=JSON.parse(hook[2].body);assert.equal(request.project,'prj_fixture');assert.equal(request.gitSource.ref,'main');assert.equal(request.meta.publishingJobId,id);
+  assert.equal(hook[2].redirect,'error');assert.equal(hook[2].headers.authorization,'Bearer fixture-token');
+  assert.ok(h.calls.findIndex(c=>c[0]==='wait')<h.calls.indexOf(hook));
+  const resultState=updates(h).map(fields).find(v=>v.deploymentId);
+  assert.equal(resultState.status,'deployment_requested');assert.equal(resultState.deploymentId,'dpl_exact');assert.equal(resultState.deploymentUrl,'https://fixture.vercel.app');
+  assert.equal(resultState.vercelJobId,undefined);
+});
+
+test('unconfirmed Vercel API responses become ambiguous terminal jobs, never automatic deploy retries',async()=>{
+  for(const fetchBody of [{id:'dpl_exact',projectId:'prj_other',url:'fixture.vercel.app'},{id:'dpl_exact',projectId:'prj_fixture',url:'evil.example'}, {id:'bad',projectId:'prj_fixture',url:'fixture.vercel.app'},{}]) {
+    const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},fetchBody});
+    const result=await h.load('worker').handler(records,context);assert.equal(result.batchItemFailures.length,0);
+    assert.equal(h.calls.filter(c=>c[0]==='hook').length,1);assert.ok(statuses(h).includes('hook_unknown'));assert.ok(!statuses(h).includes('retry'));
+    assert.ok(!updates(h).map(fields).some(v=>v.deploymentId));
+  }
+});
+
+test('checkpoint retry reuses exported paths and invalidation instead of repeating export',async()=>{
+  const h=harness({prior:{status:'retry',requestHash:fingerprint(),paths:['/builder/pages/checkpoint.json'],invalidationId:'prior-invalidation'}});
+  await h.load('worker').handler(records,context);
+  assert.ok(!h.calls.some(c=>['assets','pages','cf'].includes(c[0])));assert.equal(h.calls.filter(c=>c[0]==='wait').length,1);
+  assert.equal(h.calls.filter(c=>c[0]==='hook').length,1);assert.ok(statuses(h).includes('deployment_requested'));
+});
+
+test('same-key race returns the winning persisted Slack target rather than the later request target',async()=>{
+  let reads=0;
+  const winner={status:'queued',requestHash:fingerprint(),slack:{channel:'CWINNER',ts:'1792687000.123456'}};
+  const h=harness({prior:()=>++reads===1?undefined:winner,dbError:Object.assign(Error('raced'),{name:'ConditionalCheckFailedException'})});
+  const response=await h.load('ingress').handler({...event(),body:JSON.stringify({slack:{channel:'CLATER',ts:'1792687001.123456'}})});
+  assert.equal(response.statusCode,202);assert.deepEqual(JSON.parse(response.body).slack,winner.slack);
+  assert.equal(h.calls.filter(c=>c[0]==='sqs').length,1);
+});
+
+test('active worker lease conflict fails the delivery before exports or external deployment',async()=>{
+  const h=harness({prior:{status:'running',requestHash:fingerprint()},dbError:Object.assign(Error('leased'),{name:'ConditionalCheckFailedException'})});
+  const response=await h.load('worker').handler(records,context);
+  assert.equal(response.batchItemFailures.length,1);
+  assert.deepEqual(h.calls.map(c=>c[0]),['db']);
+  const claim=updates(h)[0];assert.match(claim.ConditionExpression,/leaseUntil < :now/);
+});
+
+test('Vercel API timeout retains durable dispatch intent and stops automatic redelivery',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},hookError:true});
+  const result=await h.load('worker').handler(records,context);assert.equal(result.batchItemFailures.length,0);
+  const hookIndex=h.calls.findIndex(c=>c[0]==='hook');
+  const intentIndex=h.calls.findIndex(c=>c[0]==='db'&&fields(c[1]).status==='hook_dispatching');
+  assert.ok(intentIndex>=0&&intentIndex<hookIndex);
+  assert.equal(h.calls.filter(c=>c[0]==='hook').length,1);assert.ok(statuses(h).includes('hook_unknown'));
+  assert.ok(!statuses(h).includes('retry'));
 });

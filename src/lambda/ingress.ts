@@ -4,6 +4,8 @@ import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEventV2 } from 'aws-lambda';
 import { db, table, getJob, readSecret, requirePatchedNode, terminalStatuses } from './common';
 
+const statusFields = ['status','phase','mode','createdAt','updatedAt','vercelJobId','deploymentId','deploymentUrl','missingAssetCount','assetTotal','assetCompleted','assetUploaded','assetSkipped','assetFailed','pageTotal','pageCompleted','slack'];
+const publicJob = (job: Record<string, unknown>) => Object.fromEntries(statusFields.filter(k => job[k] !== undefined).map(k => [k,k === 'slack' && job.slack ? {channel:(job.slack as any).channel,ts:(job.slack as any).ts} : job[k]]));
 const sqs = new SQSClient({});
 const hash = (value: string) => createHash('sha256').update(value).digest();
 const reply = (statusCode: number, body: object) => ({ statusCode, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify(body) });
@@ -18,13 +20,13 @@ export async function handler(event: APIGatewayProxyEventV2) {
       const id = event.pathParameters?.jobId || '';
       if (!/^[a-f0-9]{64}$/.test(id)) return reply(400, { error: 'Invalid job ID' });
       const job = await getJob(id);
-      return job ? reply(200, { jobId: id, status: job.status, updatedAt: job.updatedAt, vercelJobId: job.vercelJobId, missingAssetCount: job.missingAssetCount }) : reply(404, { error: 'Job not found' });
+      return job ? reply(200, { jobId: id, ...publicJob(job) }) : reply(404, { error: 'Job not found' });
     }
     if (event.requestContext.http.method !== 'POST' || event.rawPath !== '/api/deploy') return reply(404, { error: 'Not found' });
     if (process.env.PUBLISH_ENABLED !== 'true') return reply(503, { error: 'Publishing is paused' });
     const key = event.headers?.['idempotency-key'];
     if (!key || key.length < 16 || key.length > 128 || !/^[A-Za-z0-9:_-]+$/.test(key)) return reply(400, { error: 'A valid Idempotency-Key is required' });
-    let payload: { mode?: string; pageId?: string } = {};
+    let payload: { mode?: string; pageId?: string; slack?: {channel:string;ts:string} } = {};
     if (event.body) {
       if (event.isBase64Encoded || event.body.length > 4096) return reply(400, { error: 'Invalid payload' });
       try { payload = JSON.parse(event.body); } catch { return reply(400, { error: 'Invalid JSON' }); }
@@ -33,24 +35,29 @@ export async function handler(event: APIGatewayProxyEventV2) {
     const mode = payload.mode === undefined ? 'deploy' : payload.mode;
     const pageId = payload.pageId;
     if (!['sync','deploy'].includes(mode) || (pageId !== undefined && (typeof pageId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(pageId)))) return reply(400, { error: 'Invalid publishing request' });
+    const suppliedSlack = payload.slack;
+    let slack = suppliedSlack;
+    if (slack !== undefined && (!slack || typeof slack !== 'object' || typeof slack.channel !== 'string' || !/^[CDG][A-Z0-9]{1,30}$/.test(slack.channel) || typeof slack.ts !== 'string' || !/^\d{10,16}\.\d{6}$/.test(slack.ts))) return reply(400, {error:'Invalid notification target'});
+    if (slack) slack = {channel:slack.channel,ts:slack.ts};
     const requestHash = hash(JSON.stringify({ mode, pageId })).toString('hex');
     const jobId = hash(key).toString('hex');
     const existing = await getJob(jobId);
     if (existing?.requestHash && existing.requestHash !== requestHash) return reply(409, { error: 'Idempotency key already used for a different request' });
-    if (existing && terminalStatuses.has(existing.status)) return reply(409, { error: 'Job already processed; check its status', jobId, status: existing.status });
+    if (existing && terminalStatuses.has(existing.status)) return reply(409, { error: 'Job already processed; check its status', jobId, ...publicJob(existing) });
     if (!existing) {
       // Acceptance is based on durable queue delivery, never a database record alone.
-      await sqs.send(new SendMessageCommand({ QueueUrl: process.env.QUEUE_URL!, MessageBody: JSON.stringify({ jobId, mode, pageId, requestHash }), MessageGroupId: 'production', MessageDeduplicationId: jobId }));
+      await sqs.send(new SendMessageCommand({ QueueUrl: process.env.QUEUE_URL!, MessageBody: JSON.stringify({ jobId, mode, pageId, requestHash, slack }), MessageGroupId: 'production', MessageDeduplicationId: jobId }));
       const now = Math.floor(Date.now() / 1000);
       try {
-        await db.send(new PutCommand({ TableName: table, Item: { jobId, requestHash, status: 'queued', updatedAt: now, expiresAt: now + 30 * 86400 }, ConditionExpression: 'attribute_not_exists(jobId)' }));
+        await db.send(new PutCommand({ TableName: table, Item: { jobId, requestHash, mode, slack, monitorKey:'active', createdAt:now, phase:'queued', status: 'queued', updatedAt: now, expiresAt: now + 30 * 86400 }, ConditionExpression: 'attribute_not_exists(jobId)' }));
       } catch (e) {
         if ((e as Error).name !== 'ConditionalCheckFailedException') throw e;
         const winner = await getJob(jobId);
         if (winner?.requestHash !== requestHash) return reply(409, { error: 'Idempotency key already used for a different request' });
       }
     }
-    return reply(202, { jobId, status: 'queued' });
+    const accepted = existing || await getJob(jobId);
+    return reply(202, { jobId, status: 'queued', ...(accepted?.slack ? {slack:accepted.slack} : !accepted && slack ? {slack} : {}) });
   } catch {
     console.error('Ingress request failed');
     return reply(503, { error: 'Publishing service unavailable' });

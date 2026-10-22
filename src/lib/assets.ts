@@ -333,16 +333,32 @@ export type PushAssetsResult = {
   failed: { id: string; error: string }[];
 };
 
-export const pushAssets = async (): Promise<PushAssetsResult> => {
+export type AssetProgress = {
+  total: number; completed: number; uploaded: number; skipped: number; failed: number;
+};
+// Called after enumeration and each processed item; callers own throttling/timeouts.
+// Awaited for ordering, but telemetry failures must never abort publishing.
+export type PushAssetsOptions = { onProgress?: (progress: AssetProgress) => Promise<void> | void };
+
+export const pushAssets = async (options: PushAssetsOptions = {}): Promise<PushAssetsResult> => {
   exportStorageConfig();
   const assets = await fetchAllAssets();
   const uploaded: PushAssetsResult['uploaded'] = [];
   const skipped: PushAssetsResult['skipped'] = [];
   const failed: PushAssetsResult['failed'] = [];
+  const reportProgress = async () => {
+    if (!options.onProgress) return;
+    try {
+      await options.onProgress({ total: assets.length, completed: uploaded.length + skipped.length + failed.length,
+        uploaded: uploaded.length, skipped: skipped.length, failed: failed.length });
+    } catch { console.warn('Asset progress reporting failed'); }
+  };
+  await reportProgress();
 
   for (const asset of assets) {
     if (!asset.url) {
       skipped.push({ id: asset.id, reason: 'missing url' });
+      await reportProgress();
       continue;
     }
 
@@ -357,6 +373,7 @@ export const pushAssets = async (): Promise<PushAssetsResult> => {
       const message = e instanceof Error ? e.message : String(e);
       failed.push({ id: asset.id, error: message });
     }
+    await reportProgress();
   }
 
   return { uploaded, skipped, failed };

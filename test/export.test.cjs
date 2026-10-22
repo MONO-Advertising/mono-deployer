@@ -209,3 +209,75 @@ test('registered asset download 404 remains a hard failure instead of a skipped 
   assert.equal(h.uploads.length, 0);
   assert.equal(h.copies.length, 0);
 });
+
+test('asset progress counts uploaded, missing-url skips and failures without exposing asset data', async () => {
+  const base = 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2F';
+  const h = harness([], [
+    { id: 'ok', name: 'private-name', url: base + 'ok.png', type: 'image/png' },
+    { id: 'no-url' },
+    { id: 'broken', url: base + 'broken.png', type: 'image/png' },
+  ], {}, { fetchAsset: async url => url.includes('broken')
+    ? new Response(null, { status: 404 }) : new Response('image', { headers: { 'content-type': 'image/png' } }) });
+  const snapshots = [];
+  const result = await h.load('assets').pushAssets({ onProgress: async progress => snapshots.push(JSON.parse(JSON.stringify(progress))) });
+  assert.deepEqual(snapshots, [
+    { total: 3, completed: 0, uploaded: 0, skipped: 0, failed: 0 },
+    { total: 3, completed: 1, uploaded: 1, skipped: 0, failed: 0 },
+    { total: 3, completed: 2, uploaded: 1, skipped: 1, failed: 0 },
+    { total: 3, completed: 3, uploaded: 1, skipped: 1, failed: 1 },
+  ]);
+  assert.equal(result.failed.length, 1);
+});
+
+test('page progress is awaited and counts processed non-routable pages without claiming an upload', async () => {
+  const unroutable = page('no-route');
+  delete unroutable.query;
+  const h = harness([page('one'), unroutable]);
+  const snapshots = [];
+  let release;
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const pending = h.load('push-to-env').pushToEnvironment(undefined, {
+    invalidate: false,
+    onProgress: async progress => {
+      snapshots.push(JSON.parse(JSON.stringify(progress)));
+      if (progress.completed === 0) { entered(); await gate; }
+    },
+  });
+  await started;
+  assert.equal(h.uploads.length, 0, 'export waits for the initial progress callback');
+  release();
+  const result = await pending;
+  assert.equal(result.paths.length, 1);
+  assert.deepEqual(snapshots, [{ total: 2, completed: 0 }, { total: 2, completed: 1 }, { total: 2, completed: 2 }]);
+});
+
+test('progress reporting rejection cannot turn a successful export into failure', async () => {
+  const url = 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fok.png';
+  const h = harness([page('one')], [{ id: 'ok', url, type: 'image/png' }]);
+  const reject = async () => { throw new Error('telemetry unavailable'); };
+  const assets = await h.load('assets').pushAssets({ onProgress: reject });
+  assert.equal(assets.uploaded.length, 1);
+  assert.equal(assets.failed.length, 0);
+  const pages = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false, onProgress: reject });
+  assert.equal(pages.paths.length, 1);
+});
+
+test('empty exports emit a zero-total snapshot and a failed page never reports completed', async () => {
+  const h = harness([]);
+  const assets = [];
+  const pages = [];
+  await h.load('assets').pushAssets({ onProgress: value => assets.push(JSON.parse(JSON.stringify(value))) });
+  await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false, onProgress: value => pages.push(JSON.parse(JSON.stringify(value))) });
+  assert.deepEqual(assets, [{ total: 0, completed: 0, uploaded: 0, skipped: 0, failed: 0 }]);
+  assert.deepEqual(pages, [{ total: 0, completed: 0 }]);
+  const failed = harness([page('broken', 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fbad.png')], [], {}, {
+    fetchAsset: async () => new Response(null, { status: 503 }),
+  });
+  const progress = [];
+  await assert.rejects(failed.load('push-to-env').pushToEnvironment(undefined, {
+    invalidate: false, onProgress: value => progress.push(JSON.parse(JSON.stringify(value))),
+  }), /Asset metadata request failed/);
+  assert.deepEqual(progress, [{ total: 1, completed: 0 }]);
+});

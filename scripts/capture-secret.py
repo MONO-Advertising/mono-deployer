@@ -6,9 +6,9 @@ import os
 import pathlib
 import sys
 
-fields = {'builder': 'BUILDER_PRIVATE_KEY', 'webhook': 'BUILDER_WEBHOOK_SECRET'}
+fields = {'builder': 'BUILDER_PRIVATE_KEY', 'webhook': 'BUILDER_WEBHOOK_SECRET', 'vercel': 'VERCEL_API_TOKEN'}
 if len(sys.argv) != 2 or sys.argv[1] not in fields:
-    raise SystemExit('Usage: python3 scripts/capture-secret.py builder|webhook')
+    raise SystemExit('Usage: python3 scripts/capture-secret.py builder|webhook|vercel')
 kind = sys.argv[1]
 value = getpass.getpass('Paste the NEW ' + fields[kind] + ' (input is hidden): ').strip()
 if len(value) < 24:

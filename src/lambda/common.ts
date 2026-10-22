@@ -19,4 +19,4 @@ export function requirePatchedNode(version = process.versions.node) {
 export async function getJob(jobId: string) {
   return (await db.send(new GetCommand({ TableName: table, Key: { jobId }, ConsistentRead: true }))).Item;
 }
-export const terminalStatuses = new Set(['deployment_requested', 'hook_unknown', 'validated', 'synced']);
+export const terminalStatuses = new Set(['deployment_requested', 'hook_unknown', 'validated', 'synced', 'building', 'ready', 'live', 'failed', 'attention_required']);
