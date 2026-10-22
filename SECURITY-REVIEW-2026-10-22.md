@@ -32,7 +32,7 @@ advisories remain documented in its migration PR. Obsolete AWS keys, Builder
 private key, and Vercel hook have been removed from all website environments;
 only the Lambda worker needs the provider secrets. A read-only check of the
 previous Builder private key returned authentication errors, confirming it no
-longer authenticates. Thirty deployer tests pass on patched Node.
+longer authenticates. Thirty-four deployer tests pass on patched Node.
 
 ## Publishing architecture and security boundaries
 
@@ -242,3 +242,15 @@ Page writes remain visible individually rather than as an atomic complete export
 Versioned export prefixes with a promotion step are a future hardening option.
 Preserve the existing public serving infrastructure during cutover. Rollback must
 not reactivate exposed AWS credentials or restart the compromised Railway setup.
+
+## Verified isolated export result
+
+The deployed worker completed a validation export of 1,155 Builder assets and
+61 pages on Node 22.23.4 in 117.984 seconds with existing mirrored assets. It
+reported zero asset download failures and one pre-existing deleted Builder image
+reference (`c4c55951f3a34fa6a41df04750f923f6`). The original URL is retained and
+reported rather than replaced with a nonexistent S3 URL. Registered asset download
+failures and non-404 metadata failures still stop publishing. The initial cold
+asset-copy run plus page failure took approximately 652 seconds; retries reuse
+mirrored assets. Production invalidation and deploy-hook timing still need live
+operational confirmation.
