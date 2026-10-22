@@ -1,0 +1,49 @@
+{
+  "Version": "2012-10-17",
+  "Id": "Policy1538073402602",
+  "Statement": [
+    {
+      "Sid": "Stmt1538073316497",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::150101466270:user/mono-website-imgix"
+      },
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::mono-website-assets/*",
+        "arn:aws:s3:::mono-website-assets"
+      ]
+    },
+    {
+      "Sid": "AllowCloudFrontServicePrincipal",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::mono-website-assets/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::150101466270:distribution/E1S6IGPBXC7JNY"
+        }
+      }
+    },
+    {
+      "Sid": "Stmt1538073346015",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::150101466270:user/mono_grant",
+          "arn:aws:iam::150101466270:user/mono_patrick",
+          "arn:aws:iam::150101466270:user/mono-website-deploy",
+          "arn:aws:iam::150101466270:user/mono-website"
+        ]
+      },
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::mono-website-assets/*",
+        "arn:aws:s3:::mono-website-assets"
+      ]
+    }
+  ]
+}
