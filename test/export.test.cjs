@@ -9,6 +9,7 @@ const { createRequire } = require('node:module');
 function harness(pages, assets = [], environment = {}, providers = {}) {
   const uploads = [];
   const copies = [];
+  const s3Requests = [];
   const pageRequests = [];
   const assetRequests = [];
   const env = {
@@ -20,7 +21,8 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
   };
   const mocks = {
     '@aws-sdk/client-s3': {
-      S3Client: class { async send(command) { if (command.copy) { copies.push(command.input); return {}; } throw Object.assign(new Error('missing'), { name: 'NotFound' }); } },
+      S3Client: class { async send(command) { s3Requests.push(command); if (providers.s3Send) return providers.s3Send(command); if (command.list) return { Contents: [], IsTruncated: false }; if (command.copy) { copies.push(command.input); return {}; } throw Object.assign(new Error('missing'), { name: 'NotFound' }); } },
+      ListObjectsV2Command: class { constructor(input) { this.input = input; this.list = true; } },
       HeadObjectCommand: class { constructor(input) { this.input = input; } },
       CopyObjectCommand: class { constructor(input) { this.input = input; this.copy = true; } },
     },
@@ -30,7 +32,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
       CreateInvalidationCommand: class { constructor(input) { this.input = input; } },
     },
     '@aws-sdk/lib-storage': {
-      Upload: class { constructor({ params }) { this.params = params; } async done() { uploads.push(this.params); return {}; } },
+      Upload: class { constructor({ params }) { this.params = params; } async done() { if (providers.upload) await providers.upload(this.params); uploads.push(this.params); return {}; } },
     },
     '@builder.io/sdk-react': {
       fetchEntries: async (request) => {
@@ -47,7 +49,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
         return url;
       },
       fetchAsset: providers.fetchAsset || (async () => new Response('fixture-image', { headers: { 'content-type': 'image/png' } })),
-      readAsset: async response => Buffer.from(await response.arrayBuffer()),
+      readAsset: providers.readAsset || (async response => Buffer.from(await response.arrayBuffer())),
     },
   };
   const cache = new Map();
@@ -81,7 +83,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
     vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
     return module.exports;
   }
-  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, pageRequests, assetRequests };
+  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, pageRequests, assetRequests, s3Requests };
 }
 
 function page(id, image) {
@@ -220,12 +222,13 @@ test('asset progress counts uploaded, missing-url skips and failures without exp
     ? new Response(null, { status: 404 }) : new Response('image', { headers: { 'content-type': 'image/png' } }) });
   const snapshots = [];
   const result = await h.load('assets').pushAssets({ onProgress: async progress => snapshots.push(JSON.parse(JSON.stringify(progress))) });
-  assert.deepEqual(snapshots, [
-    { total: 3, completed: 0, uploaded: 0, skipped: 0, failed: 0 },
-    { total: 3, completed: 1, uploaded: 1, skipped: 0, failed: 0 },
-    { total: 3, completed: 2, uploaded: 1, skipped: 1, failed: 0 },
-    { total: 3, completed: 3, uploaded: 1, skipped: 1, failed: 1 },
-  ]);
+  assert.deepEqual(snapshots.map(p => p.completed), [0, 1, 2, 3]);
+  assert.deepEqual(snapshots[0], { total: 3, completed: 0, uploaded: 0, skipped: 0, failed: 0 });
+  assert.deepEqual(snapshots.at(-1), { total: 3, completed: 3, uploaded: 1, skipped: 1, failed: 1 });
+  for (const p of snapshots) {
+    assert.equal(p.completed, p.uploaded + p.skipped + p.failed);
+    assert.deepEqual(Object.keys(p).sort(), ['completed', 'failed', 'skipped', 'total', 'uploaded']);
+  }
   assert.equal(result.failed.length, 1);
 });
 
@@ -280,4 +283,102 @@ test('empty exports emit a zero-total snapshot and a failed page never reports c
     invalidate: false, onProgress: value => progress.push(JSON.parse(JSON.stringify(value))),
   }), /Asset metadata request failed/);
   assert.deepEqual(progress, [{ total: 1, completed: 0 }]);
+});
+
+
+const assetFixture = i => ({ id: 'asset-' + i, name: null, type: 'image/png', url: 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fasset-' + i });
+const canonicalKey = i => 'builder/api/v1/image/assets/space/asset-' + i + '.png';
+const aliasKey = i => 'builder/api/v1/image/assets/space/asset-' + i;
+const missingObject = () => Object.assign(new Error('missing'), { name: 'NotFound' });
+
+test('paginated inventory skips existing canonical objects and raw aliases without per-asset HEAD or downloads', async () => {
+  const h = harness([], [assetFixture(0), assetFixture(1)], {}, {
+    s3Send: async command => {
+      assert.equal(command.list, true, 'warm inventory must eliminate HEAD and Copy calls');
+      assert.equal(command.input.Prefix, 'builder/');
+      assert.equal(command.input.MaxKeys, 1000);
+      return command.input.ContinuationToken
+        ? { Contents: [{ Key: canonicalKey(1) }, { Key: aliasKey(1) }], IsTruncated: false }
+        : { Contents: [{ Key: canonicalKey(0) }, { Key: aliasKey(0) }], IsTruncated: true, NextContinuationToken: 'page-two' };
+    },
+    fetchAsset: async () => { throw new Error('warm assets must not be fetched'); },
+  });
+  const result = await h.load('assets').pushAssets();
+  assert.equal(result.skipped.length, 2); assert.equal(result.failed.length, 0);
+  assert.equal(h.s3Requests.length, 2); assert.equal(h.s3Requests[1].input.ContinuationToken, 'page-two');
+  assert.equal(h.uploads.length, 0);
+});
+
+test('missing raw alias is HEAD checked then repaired from inventoried canonical source', async () => {
+  const copies = [];
+  const h = harness([], [assetFixture(0)], {}, {
+    s3Send: async command => {
+      if (command.list) return { Contents: [{ Key: canonicalKey(0) }] };
+      if (command.copy) { copies.push(command.input); return {}; }
+      assert.equal(command.input.Key, aliasKey(0)); throw missingObject();
+    },
+    fetchAsset: async () => { throw new Error('existing source must not download'); },
+  });
+  const result = await h.load('assets').pushAssets();
+  assert.equal(result.failed.length, 0); assert.equal(result.skipped.length, 1);
+  assert.equal(copies.length, 1); assert.equal(copies[0].Key, aliasKey(0));
+  assert.equal(decodeURIComponent(copies[0].CopySource), 'fixture-bucket/' + canonicalKey(0));
+});
+
+test('inventory failures and malformed pagination stop safely before asset provider operations', async () => {
+  for (const list of [
+    async () => { throw new Error('AccessDenied'); },
+    async () => ({ IsTruncated: true }),
+    async () => ({ IsTruncated: true, NextContinuationToken: 'repeat' }),
+    async () => ({ Contents: [{ Key: 'outside-prefix/key' }] }),
+    async () => ({ Contents: Array.from({ length: 50001 }, (_, i) => ({ Key: 'builder/key-' + i })) }),
+  ]) {
+    let fetched = false;
+    const h = harness([], [assetFixture(0)], {}, {
+      s3Send: async command => { assert.ok(command.list); return list(); },
+      fetchAsset: async () => { fetched = true; throw new Error('unexpected download'); },
+    });
+    await assert.rejects(h.load('assets').pushAssets());
+    assert.equal(fetched, false); assert.equal(h.uploads.length, 0);
+    assert.ok(h.s3Requests.length <= 2);
+  }
+});
+
+test('asset workers cap metadata at eight and complete downloads at two while serializing progress', async () => {
+  let heads = 0, maxHeads = 0, downloads = 0, maxDownloads = 0, callbacks = 0, maxCallbacks = 0;
+  const snapshots = [];
+  const delay = () => new Promise(resolve => setTimeout(resolve, 2));
+  const h = harness([], Array.from({ length: 18 }, (_, i) => assetFixture(i)), {}, {
+    s3Send: async command => {
+      if (command.list) return { Contents: [] };
+      if (command.copy) return {};
+      heads++; maxHeads = Math.max(maxHeads, heads); await delay(); heads--; throw missingObject();
+    },
+    fetchAsset: async () => { downloads++; maxDownloads = Math.max(maxDownloads, downloads); return new Response('image', { headers: { 'content-type': 'image/png' } }); },
+    upload: async () => { await delay(); downloads--; },
+  });
+  const result = await h.load('assets').pushAssets({ onProgress: async progress => {
+    callbacks++; maxCallbacks = Math.max(maxCallbacks, callbacks); await delay();
+    snapshots.push(progress.completed); callbacks--;
+  } });
+  assert.equal(result.uploaded.length, 18); assert.equal(result.failed.length, 0);
+  assert.ok(maxHeads > 1 && maxHeads <= 8); assert.equal(maxDownloads, 2); assert.equal(maxCallbacks, 1);
+  assert.deepEqual(snapshots, Array.from({ length: 19 }, (_, i) => i));
+});
+
+test('missing inventory entry still HEAD checks before download, and access errors remain failures', async () => {
+  for (const denied of [false, true]) {
+    const h = harness([], [assetFixture(0)], {}, {
+      s3Send: async command => {
+        if (command.list) return { Contents: [] };
+        if (denied) throw new Error('AccessDenied');
+        return {}; // Object appeared after listing; do not download or overwrite it.
+      },
+      fetchAsset: async () => { throw new Error('must not download'); },
+    });
+    const result = await h.load('assets').pushAssets();
+    assert.equal(result.failed.length, denied ? 1 : 0);
+    assert.equal(result.skipped.length, denied ? 0 : 1);
+    assert.equal(h.uploads.length, 0);
+  }
 });

@@ -14,6 +14,19 @@ patched. Update its pinned version/checksum for subsequent security releases.
 The Lambda runtime rejects older Node releases. AWS access uses execution roles;
 do not restore the disabled Railway IAM key.
 
+## When to publish, sync, or rebuild
+
+Normal copy, image, and layout edits using existing components should be published in Builder. The authenticated Builder webhook is designed to enqueue **sync only**: a page event selects its page ID, known tile models refresh their mapped index page, and header/footer/site changes refresh all pages; unknown models do no work. After S3 export and CloudFront invalidation, ordinary CMS changes do not require a Vercel rebuild: the website reads page content with `no-store` and renders its catch-all route dynamically. We verified real Slack publishing end to end, but have **not verified a real Builder publish event's delivery or the webhook configuration in Builder's portal**.
+
+| Action | When to use it |
+| --- | --- |
+| **Publish in Builder** | Normal content edits; the configured webhook should sync them automatically. |
+| **Sync content only** in Slack | Recover from a failed/missing webhook, refresh after correcting a missing image, or deliberately refresh content in bulk. |
+| **Publish + rebuild** in Slack | An intentional full refresh and rebuild, including changes affecting build-time output. Code/runtime/config changes require a code deployment; merging code to `main` normally triggers that automatically. |
+
+See [the publishing client](../mono-dotcom/src/lib/publishing-client.ts) and
+[content reads](../mono-dotcom/src/lib/get-content.ts) for routing and cache behavior.
+
 ## Infrastructure and credentials
 
 `infra/template.yaml` deploys stack `mono-deployer-production` in `us-east-2`.
@@ -93,8 +106,8 @@ reported live automatically. Tracking failures stay unknown/pending; unresolved
 jobs older than 24 hours need attention.
 
 AWS progress/monitor infrastructure is deployed (`UPDATE_COMPLETE`) and its
-minute schedule is enabled with `StatusEnabled=true`. Bot PR 2 merged at
-`92617d0`; production deployment `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj` is READY
+minute schedule is enabled with `StatusEnabled=true`. Bot PR 3 merged at
+`ae478695`; production deployment `dpl_2qJaSAqazabUV9hJHud378Gngtqg` has its production alias verified
 on Node 22.23.4. Unsigned callback requests returned 401; a correctly signed
 unknown-job callback returned 404 after authentication, without sending Slack
 messages.
@@ -106,7 +119,28 @@ Its correlated job is
 The scheduled monitor independently recorded `status=live`, `phase=live`, and
 `monitorCheckedAt=1792699571`, then removed `monitorKey`, confirming the exact
 deployment, production-alias, and HTML-health verification path. This test performed
-no CMS export; no real Slack publishing submission has been tested.
+no CMS export. A subsequent real Slack publish completed production export, deployment,
+and notification: job `c8976c8774acc8e487b59151b218f3ca37e63b0735fea64625300f6ebae7a1ce`
+reached `live` for `dpl_AaYHfsfo6R9rvYVNHCunhCy95roX`, with `monitorKey` removed.
+It reused 1,155 assets and processed 61 pages in 482 seconds end to end, before
+the optimization below. One known deleted Builder image on `/work/lidl` remains
+an editorial repair; its source URL was preserved and the Slack thread received
+a warning explanation. See the architecture guide for the exact entry and field.
+
+Asset sync now uses a paginated prefix-only S3 inventory (50,000-key/100-page
+limits), eight workers, and two download/upload slots. Known existing canonical
+objects and raw aliases skip HEAD requests; absent keys still receive HEAD checks,
+and missing aliases are repaired. Inventory failures stop the export. Progress
+callbacks remain ordered under concurrency. A local read-only benchmark over the
+same 1,155 assets improved from 124.603 seconds / 2,307 HEAD requests to 35.568
+seconds / three LIST requests (about 71% less time, 3.5× faster), with writes
+blocked and no failures. This is not a Lambda or total publish-time benchmark.
+
+The optimization and stable primary-host callback fix are deployed: AWS reports
+`UPDATE_COMPLETE`, worker health confirms Node 22.23.4 and ready secrets, and
+publishing is enabled. Signed unknown-job callback verification returned 404;
+an idle monitor invocation completed without errors. Publisher tests: 64 passing;
+bot tests: 30 passing.
 
 The installed `mono-publishing-status` token is verified as scoped only to the
 `mono-dotcom` website project (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored

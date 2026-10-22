@@ -4,22 +4,24 @@ Updated October 22, 2026. This document describes the migrated implementation an
 
 ## Deployment status and verification boundary
 
-The migrated website and Slack bot containers have now been promoted. The latest verified website deployment is `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`; the bot deployment is `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj`. Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
+The migrated website and Slack bot containers have now been promoted. The latest verified website deployment is `dpl_AaYHfsfo6R9rvYVNHCunhCy95roX`; the bot deployment is `dpl_2qJaSAqazabUV9hJHud378Gngtqg` (production alias verified). Deployer PR 2, website PR 18, and bot PR 1 were merged. The AWS stack `mono-deployer-production` in `us-east-2` is `UPDATE_COMPLETE`, its functions are active, and both publishing gates are enabled.
 
 Verified during this work:
 
 - Actual serving Node version is **22.23.4** on both Vercel containers and AWS Lambda; build-time version alone was insufficient evidence.
 - Website homepage, work/news pages, compiled JavaScript, redirects, and authentication checks passed. A signed Builder webhook for an unknown model returned a no-op response; it did not publish anything.
-- The bot rejects unsigned Slack HTTP requests with 401. No real Slack publish submission was sent.
+- The bot rejects unsigned Slack HTTP requests with 401. A real Slack publishing submission completed its production CMS export, website deployment, and final status notification.
 - An isolated full Lambda export covered 1,155 assets and 61 pages. The cold asset-copy run took approximately 652 seconds; a warm retry took approximately 118 seconds. These runs wrote a validation prefix, not production page objects, and did not invoke the Vercel deploy hook.
 - AWS queue and dead-letter queue were empty at the final check; secrets were ready. The old AWS access key is inactive and its IAM principal was removed from the bucket policy.
 - Recent error-log queries on the promoted website and bot returned no entries. This is a bounded observation, not a guarantee of future operation.
 
-**A real production CMS export and end-to-end Slack-triggered deployment have not been exercised.** Normal production publishing is enabled, but acceptance, export completion, Vercel build completion, and successful production serving are distinct milestones.
+**A real production CMS export and end-to-end Slack-triggered deployment passed.** Job `c8976c8774acc8e487b59151b218f3ca37e63b0735fea64625300f6ebae7a1ce` reached `live` for deployment `dpl_AaYHfsfo6R9rvYVNHCunhCy95roX`, was notified, and had `monitorKey` removed. It reused 1,155 assets and processed 61 pages in 482 seconds from job creation to completion (Unix timestamps 1792699750–1792700232). This run preceded the asset-sync optimization below; it is not an optimized Lambda timing. Acceptance, export completion, Vercel build completion, and successful production serving remain distinct milestones.
 
-## Status-card upgrade: live and dedicated rebuild verified
+The run reported one existing missing image: Builder entry `35b5c7ebf18249b987a8e8089cff3379`, **Work-Lidl**, route `/work/lidl`, field `data.image`, references deleted Builder asset `c4c55951f3a34fa6a41df04750f923f6`. Its original URL was preserved and a warning explanation was posted in the Slack thread. Editors must replace that reference; successful publishing does not repair the source image.
 
-The credential/runtime migration and status-card upgrade are live. Bot PR 2 merged at `92617d0`; production deployment `dpl_66mLa2KWTmC5qn2nFGPDQqwpRnsj` is READY and serves patched Node 22.23.4. AWS is `UPDATE_COMPLETE` with `StatusEnabled=true`, so the one-minute monitor schedule is enabled.
+## Status-card upgrade: live and end-to-end publishing verified
+
+The credential/runtime migration and status-card upgrade are live. Bot PR 2 merged at `92617d0`, followed by PR 3 at `ae478695`; the verified production deployment `dpl_2qJaSAqazabUV9hJHud378Gngtqg` serves patched Node 22.23.4. The bot suite passes 30 tests. AWS is `UPDATE_COMPLETE` with `StatusEnabled=true`, so the one-minute monitor schedule is enabled.
 
 Callback verification against the configured monitor hostname returned 401 unsigned and 404 for a correctly signed unknown-job callback: signature authentication passed, but no job/destination was found. No Slack messages were sent by those probes. A dedicated API rebuild verification was accepted as deployment `dpl_7a2HiCQx2Ck3HWBirD1wdGY3fk7G`, correlated to job `7af5c8688eb098b23ea58457abe189d37dc372b3bef1d7026a1fedf0f82654bf`. It completed **READY with production target**. The scheduled monitor independently recorded `status=live`, `phase=live`, and `monitorCheckedAt=1792699571`, then removed `monitorKey` from the completed job. This verifies the exact-deployment/production-alias/HTML-health path through the scheduled monitor. This dedicated test did not perform a CMS export or send a real Slack publishing submission.
 
@@ -39,11 +41,23 @@ With `VERCEL_API_TOKEN` configured, the worker creates a production deployment t
 
 A ready but unpromoted deployment stays `ready` / `awaiting_promotion`; a failing homepage check stays pending. Provider/API errors are logged as tracking unavailable rather than invented success. Canceled/failed builds become `failed`; unresolved jobs older than 24 hours become `attention_required`. The HTML probe is a bounded availability check, not visual testing, asset coverage, or proof that every CMS page is correct. The legacy deploy-hook path remains compatible, but without an exact deployment ID the monitor cannot infer completion from a nearby build or a working homepage.
 
-Notifications go to the bot's `/internal/publishing-status` endpoint using a separate HMAC-SHA256 signature over `timestamp + '.' + raw JSON body`. The bot uses `BOT_STATUS_SIGNING_SECRET`, rejects timestamps outside a five-minute window, caps bodies at 16 KiB, validates the destination and job fields, and updates the existing Slack message. This credential is distinct from Slack's own `SLACK_SIGNING_SECRET` and from the publishing ingress key. The callback carries only a status allowlist and destination, not Builder credentials, raw export paths, request fingerprints, or Vercel tokens.
+Notifications use the bot's stable primary hostname, rather than an immutable deployment hostname, and its `/internal/publishing-status` endpoint using a separate HMAC-SHA256 signature over `timestamp + '.' + raw JSON body`. The bot uses `BOT_STATUS_SIGNING_SECRET`, rejects timestamps outside a five-minute window, caps bodies at 16 KiB, validates the destination and job fields, and updates the existing Slack message. This credential is distinct from Slack's own `SLACK_SIGNING_SECRET` and from the publishing ingress key. The callback carries only a status allowlist and destination, not Builder credentials, raw export paths, request fingerprints, or Vercel tokens.
 
 **Tracking credentials:** the installed `mono-publishing-status` Vercel token was verified as scoped only to website project `mono-dotcom` (`prj_bsxsisiRxAzCsu5HcBMXMZ2Avwfv`). It is stored as `VERCEL_API_TOKEN` in `mono-deployer/production/vercel-automation` (`TrackingSecret`), readable by the worker and monitor. The monitor's secret permissions cover only `TrackingSecret` and the callback-signing `StatusSecret`; it cannot read the Builder private key in `PublishingSecret`. A mistakenly bot-scoped token was revoked.
 
-The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Bot promotion, signed callback authentication checks, and `StatusEnabled` enablement are complete. The dedicated API rebuild and scheduled production-health verification succeeded; a real Slack-driven publish including a production CMS export remains the untested integrated path.
+The token expires **October 22, 2027 at 20:54 America/Chicago** (October 23 UTC). Renewal reminders were created for September 22 and October 15, 2027. Renew the website-scoped credential before expiry, replace the value in the tracking secret, and verify an authenticated read of the intended website project. Reminders do not rotate the token themselves. Expiration or permission failures must remain tracking errors, never a false “Published” result. Bot promotion, signed callback authentication checks, and `StatusEnabled` enablement are complete. The dedicated API rebuild, scheduled production-health verification, and subsequent real Slack-driven production CMS publish all succeeded.
+
+## When to publish, sync, or rebuild
+
+Normal copy, image, and layout edits using existing components should be published in Builder. The authenticated Builder webhook is designed to enqueue **sync only**: a page event selects its page ID, known tile models refresh their mapped index page, and header/footer/site changes refresh all pages; unknown models do no work. After S3 export and CloudFront invalidation, ordinary CMS changes do not require a Vercel rebuild: the website reads page content with `no-store` and renders its catch-all route dynamically. We verified real Slack publishing end to end, but have **not verified a real Builder publish event's delivery or the webhook configuration in Builder's portal**.
+
+| Action | When to use it |
+| --- | --- |
+| **Publish in Builder** | Normal content edits; the configured webhook should sync them automatically. |
+| **Sync content only** in Slack | Recover from a failed/missing webhook, refresh after correcting a missing image, or deliberately refresh content in bulk. |
+| **Publish + rebuild** in Slack | An intentional full refresh and rebuild, including changes affecting build-time output. Code/runtime/config changes require a code deployment; merging code to `main` normally triggers that automatically. |
+
+Sources: [publishing-client.ts](../../mono-dotcom/src/lib/publishing-client.ts), [get-content.ts](../../mono-dotcom/src/lib/get-content.ts), and the [dynamic page route](../../mono-dotcom/src/app/[[...slug]]/page.tsx).
 
 ## Repository boundaries
 
@@ -225,6 +239,12 @@ A failed pre-hook attempt sets `retry` and returns a partial batch failure. The 
 
 The [asset exporter](../src/lib/assets.ts) queries Builder's asset catalog with the private API credential, paginates it, and mirrors allowed assets. [Asset fetching](../src/lib/asset-fetch.ts) accepts only HTTPS `cdn.builder.io` URLs, rejects redirects and unsafe paths, imposes a 60-second deadline and 256 MiB size limit, and does not treat arbitrary page URLs as download targets.
 
+The deployed asset-sync optimization lists only the configured export prefix using paginated S3 `ListObjectsV2`, capped at **50,000 keys and 100 pages**. Listing failures, malformed pagination, or inventory limits stop the export rather than assuming objects exist. The inventory is a positive cache: known canonical objects and raw aliases skip individual HEAD requests; absent keys still receive HEAD checks before upload/copy. Missing raw aliases are repaired from canonical objects. Existing `s3:ListBucket` permission covers this operation.
+
+Asset work uses **eight bounded workers**, with only **two concurrent full download/upload slots** and one multipart upload part in flight per upload. This bounds buffering even for large permitted assets. Progress snapshots are serialized so callbacks cannot overlap or arrive out of order; instrumentation failures do not abort publishing.
+
+A local read-only comparison against the same 1,155 existing production assets took **124.603 seconds and 2,307 HEAD requests** before optimization versus **35.568 seconds and three LIST requests** afterward: approximately **71% less time (3.5× faster)**. Writes were blocked and neither run had failures. This measures local warm asset synchronization, not Lambda duration, cold uploads, cache invalidation, or total publishing time. The publisher suite passes 64 tests, including pagination, inventory limits, concurrency bounds, missing-alias repair, and failure handling. AWS deployment of the optimization and stable callback-host fix completed with `UPDATE_COMPLETE`; worker health reported Node 22.23.4, ready secrets, and publishing enabled. The callback hostname was checked in deployed configuration; a signed unknown-job probe returned 404 and an idle monitor invocation processed zero jobs without errors.
+
 The [page exporter](../src/lib/push-to-env.ts) fetches published pages in batches, optionally selects one page ID, expands referenced Symbol blocks, restores saved HTTP binding definitions rather than freezing hydrated SDK state, mirrors literal asset references, then writes JSON snapshots. Page routes map to `builder/pages/index.json` for `/`, and nested JSON paths for other routes. An authored `exportslug` can change the final filename; review it alongside the website URL mapping.
 
 | Object family | Purpose |
@@ -331,7 +351,7 @@ To return to managed hosting later, first prove the **actual serving runtime** m
 6. **Validate without production publishing.** An IAM-authorized `{"healthcheck":true}` invocation reports runtime/secret readiness. `{"validate":true}` writes an isolated UUID prefix and returns counts, missing assets, and elapsed time without invoking Vercel or production invalidation. Reuse a recorded validation UUID only when intentionally inspecting/retrying that isolated run. Validation writes storage and may require later cleanup by an operator.
 7. **Watch the correct alarms.** DLQ and Lambda Errors alarms exist; `AlarmTopicArn` must point to an existing notification destination to deliver notifications. Caught partial-batch failures may not increment Lambda Errors, so monitor queue depth, age, DLQ, and structured job logs as well. CloudWatch log retention is 30 days.
 8. **Rotate at the issuer and update consumers.** Coordinate ingress secret changes with website/bot deployment environments; Builder webhook auth is separate. Replace Builder private credentials and Vercel hooks at their issuing services, then update Secrets Manager. Never place fresh secrets in Railway or commit them to the repositories.
-9. **Release code and hosting together.** Keep the deploy hook's configured Git branch on the migrated source. Stage with `--prod --skip-domain`, inspect runtime and behavior, then promote the verified deployment. A ready automatic Git build is not proof it is the production target; inspect deployment/alias state.
+9. **Release code and hosting together.** Keep the deploy hook's configured Git branch on the migrated source. Stage with `--prod --skip-domain`, inspect runtime and behavior, then promote the verified deployment. This flag still moved the team default alias during verification: staging is not isolated from external callers using that alias. Publishing callbacks therefore use the stable primary production hostname; check other callers before staging. A ready automatic Git build is not proof it is the production target; inspect deployment/alias state.
 
 ## Agent and maintainer entry points
 
