@@ -74,7 +74,7 @@ See `SECURITY-REVIEW-2026-10-22.md` for incident findings and cutover status.
 
 ## System documentation
 
-See [the architecture and operations guide](docs/ARCHITECTURE.md) for the
+See [the architecture and operations guide](../mono-dotcom/docs/architecture.md) for the
 website, Slack bot, Builder, image/video delivery, AWS publishing, trust boundaries,
 and recovery procedures. The security review records incident-specific evidence
 and verification limits.
@@ -152,5 +152,5 @@ was revoked. The callback signing secret remains separate.
 The token expires October 22, 2027 at 20:54 America/Chicago (October 23 UTC).
 Renewal reminders exist for September 22 and October 15, 2027; they do not perform
 the rotation. Replace the scoped token before expiration and verify access to the
-intended website project. See [the architecture guide](docs/ARCHITECTURE.md) for
+intended website project. See [the architecture guide](../mono-dotcom/docs/architecture.md) for
 the full state, verification limits, and trust model.
