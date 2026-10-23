@@ -2,7 +2,7 @@
 
 Prepared October 22, 2026. Planning report; no production settings or application code changed.
 
-**Status, October 22:** Phase 1 is live for every public page, widened from `/work` at the team's request (website PR 19, deployment `dpl_4nmqBfBNemgxhC2jD4htfbxzGKQ8`). Warm production pages measured 166 ms median. See [Cache and freshness boundaries](ARCHITECTURE.md#cache-and-freshness-boundaries) and the website's [public HTML cache](../../mono-dotcom/docs/public-html-cache-2026-10-22.md) notes. Phases 2–4 have not started.
+**Status, October 22:** Phase 1 is live for every public page, widened from `/work` at the team's request (website PR 19, deployment `dpl_4nmqBfBNemgxhC2jD4htfbxzGKQ8`). Warm production pages measured 166 ms median. Website PR 20 lengthens the shared lifetime to one hour with a day of background refresh (publishing is paused), lets browsers restore back/forward navigations, and reveals content at first paint instead of after hydration plus the authored ContentTransition delay. See [Cache and freshness boundaries](ARCHITECTURE.md#cache-and-freshness-boundaries) and the website's [public HTML cache](../../mono-dotcom/docs/public-html-cache-2026-10-22.md) notes. Phases 2–4 have not started.
 
 ## Recommendation
 
