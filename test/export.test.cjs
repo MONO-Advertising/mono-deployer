@@ -462,13 +462,49 @@ test('reconcile refuses to delete anything when the Builder listing stopped shor
   assert.ok(!failed.s3Requests.some(command => command.list));
 });
 
-test('single published page sync writes only that page and never reconciles', async () => {
+test('reconcile refuses to delete anything when the export wrote no snapshot', async () => {
+  const unroutable = id => { const fixture = page(id); delete fixture.query; return fixture; };
+  const h = harness([unroutable('one'), unroutable('two')], [], {}, { objects: ['home.json', 'work.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false });
+  assert.equal(h.deletes.length, 0);
+  assert.deepEqual(Array.from(result.paths), []);
+  assert.equal(result.pagesRemoved, 0);
+  assert.match(result.reconcileSkipped, /wrote no/i);
+});
+
+test('single published page sync writes only that page, then reconciles against a light listing', async () => {
   const h = harness([page('home'), page('about')], [], {}, { objects: ['home.json', 'about.json', 'lidl.json'].map(snapshot) });
   const result = await h.load('push-to-env').pushToEnvironment('home', { invalidate: false });
   assert.deepEqual(Array.from(result.paths), ['/' + snapshot('home.json')]);
-  assert.equal(result.pagesRemoved, 0);
-  assert.equal(h.deletes.length, 0);
+  assert.deepEqual(h.uploads.map(upload => upload.Key), [snapshot('home.json')], 'other pages are not re-exported');
   assert.equal(h.entryRequests.length, 1);
+  assert.equal(h.pageRequests[0].fields, 'id,query,data.exportslug', 'the listing carries keys, not page bodies');
+  assert.deepEqual(removedBatches(h), [[snapshot('lidl.json')]]);
+  assert.equal(result.pagesRemoved, 1);
+});
+
+test('single-page sync of a renamed published page removes its old key in the same job', async () => {
+  const renamed = { ...page('work/new-name'), id: 'work-page' };
+  const h = harness([page('home'), renamed], [], {}, { objects: ['home.json', 'work/old-name.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment('work-page');
+  assert.deepEqual(Array.from(result.paths), ['/' + snapshot('work/new-name.json')]);
+  assert.deepEqual(removedBatches(h), [[snapshot('work/old-name.json')]]);
+  assert.equal(result.pagesRemoved, 1);
+  assert.deepEqual(Array.from(result.removedKeys), [snapshot('work/old-name.json')]);
+  assert.deepEqual(Array.from(h.invalidations[0].InvalidationBatch.Paths.Items).sort(), ['work/new-name.json', 'work/old-name.json'].map(key => '/' + snapshot(key)));
+});
+
+test('single-page reconcile refuses to delete when its listing is empty or does not reproduce the page it wrote', async () => {
+  for (const [listed, reason] of [[[], /no published pages/i], [[page('about')], /listing/i]]) {
+    const h = harness([page('home'), page('about')], [], {}, {
+      objects: ['home.json', 'about.json', 'lidl.json'].map(snapshot),
+      pageList: () => listed,
+    });
+    const result = await h.load('push-to-env').pushToEnvironment('home', { invalidate: false });
+    assert.equal(h.deletes.length, 0);
+    assert.equal(result.pagesRemoved, 0);
+    assert.match(result.reconcileSkipped, reason);
+  }
 });
 
 test('single-page sync of an unpublished page reads its draft and removes only its snapshot', async () => {

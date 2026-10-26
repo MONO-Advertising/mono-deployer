@@ -82,7 +82,8 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
       paths = exported.paths;
       removedKeys = exported.removedKeys;
       if (exported.missingAssets?.length) await update({ missingAssetCount: exported.missingAssets.length });
-      if (!paths.length && !removedKeys.length) throw new Error('No published pages exported');
+      // A full export must write pages; only a single-page sync may consist of a removal alone.
+      if (!paths.length && !(pageId && removedKeys.length)) throw new Error('No published pages exported');
       // Removals checkpoint with the paths so a retry still invalidates and purges them.
       await update({ paths, pagesRemoved: exported.pagesRemoved, removedKeys, ...(exported.reconcileSkipped ? { reconcileSkipped: exported.reconcileSkipped } : {}), updatedAt: Math.floor(Date.now()/1000) });
     }

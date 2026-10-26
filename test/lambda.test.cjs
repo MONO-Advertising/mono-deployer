@@ -336,3 +336,10 @@ test('checkpoint retry invalidates recorded removals and keeps the delete-form p
   assert.deepEqual(Array.from(h.calls.find(c=>c[0]==='cf')[1].InvalidationBatch.Paths.Items),['/builder/pages/retired.json']);
   assert.deepEqual(purges(h).map(c=>c[1]),[purgeUrl('dangerously-delete-by-tags')]);assert.ok(statuses(h).includes('synced'));
 });
+
+test('a full export that wrote no page fails the job even when it removed snapshots',async()=>{
+  const h=harness({exported:removal});
+  const result=await h.load('worker').handler(records,context);
+  assert.equal(result.batchItemFailures.length,1);assert.ok(statuses(h).includes('retry'));
+  assert.ok(!h.calls.some(c=>c[0]==='cf'));assert.ok(!updates(h).map(fields).some(v=>v.paths));
+});

@@ -75,6 +75,8 @@ const builderRequest = (apiKey: string) => ({
   canTrack: false,
 });
 type BuilderRequest = ReturnType<typeof builderRequest>;
+// Enough of each page to compute its snapshot key, without page bodies.
+const KEY_FIELDS = 'id,query,data.exportslug';
 
 async function listPublishedPages(common: BuilderRequest, fields?: string): Promise<any[]> {
   const pages: any[] = [];
@@ -98,19 +100,22 @@ async function deleteSnapshots(keys: string[]): Promise<void> {
 
 type Removal = { pagesRemoved: number; removedKeys: string[]; reconcileSkipped?: string };
 
-/** Remove every snapshot a full export did not write, unless Builder's list may be incomplete. */
-async function reconcile(common: BuilderRequest, pages: any[], written: Set<string>, prefix: string): Promise<Removal> {
+/** Remove every snapshot no listed page writes, unless the listing may be incomplete or the export wrote nothing. */
+async function reconcile(common: BuilderRequest, listed: any[], written: Set<string>, prefix: string): Promise<Removal> {
   const skip = (reason: string): Removal => {
     console.warn(JSON.stringify({ event: 'reconcile_skipped', reason }));
     return { pagesRemoved: 0, removedKeys: [], reconcileSkipped: reason };
   };
-  // A failed or empty enumeration must never empty production.
-  if (!pages.length) return skip('Builder returned no published pages');
-  const stale = [...await existingKeys(`${prefix}/pages/`)].filter(key => key.endsWith('.json') && !written.has(key)).sort();
+  // A failed or empty enumeration, or an export that wrote nothing, must never empty production.
+  if (!listed.length) return skip('Builder returned no published pages');
+  if (!written.size) return skip('Export wrote no page snapshots');
+  const keep = new Set(listed.map(page => snapshotKey(page, prefix)));
+  if ([...written].some(key => !keep.has(key))) return skip('Builder page listing does not match the exported pages');
+  const stale = [...await existingKeys(`${prefix}/pages/`)].filter(key => key.endsWith('.json') && !keep.has(key)).sort();
   if (!stale.length) return { pagesRemoved: 0, removedKeys: [] };
   // Offset paging skips a page when an earlier one is unpublished mid-listing, so a
   // fresh listing must not contain any page this export did not see.
-  const seen = new Set(pages.map(page => page.id));
+  const seen = new Set(listed.map(page => page.id));
   if ((await listPublishedPages(common, 'id')).some(page => !seen.has(page.id))) return skip('Builder page listing was incomplete or changed during export');
   await deleteSnapshots(stale);
   return { pagesRemoved: stale.length, removedKeys: stale };
@@ -153,7 +158,7 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       const key = draft ? snapshotKey(draft, storage.prefix) : undefined;
       // Reconcile everything when the key is unknown or a published page (another one at
       // the same URL, or this one re-published since) still writes it.
-      if (!key || (await listPublishedPages(common, 'id,query,data.exportslug')).some(entry => snapshotKey(entry, storage.prefix) === key)) {
+      if (!key || (await listPublishedPages(common, KEY_FIELDS)).some(entry => snapshotKey(entry, storage.prefix) === key)) {
         return pushToEnvironment(undefined, options);
       }
       await deleteSnapshots([key]);
@@ -221,8 +226,9 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
     await reportProgress();
   }
   const uniquePaths = [...new Set(paths)];
-  const removal = pageId ? { pagesRemoved: 0, removedKeys: [] }
-    : await reconcile(common, pages, new Set(uniquePaths.map(written => written.slice(1))), storage.prefix);
+  // A single-page sync reconciles against a keys-only listing, so a renamed page's old key goes in the same job.
+  const listed = pageId ? await listPublishedPages(common, KEY_FIELDS) : pages;
+  const removal = await reconcile(common, listed, new Set(uniquePaths.map(written => written.slice(1))), storage.prefix);
   await invalidate([...uniquePaths, ...removal.removedKeys.map(key => '/' + key)], options);
   return { paths: uniquePaths, missingAssets: [...missingAssets], ...removal };
 };
