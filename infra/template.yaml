@@ -28,6 +28,11 @@ Parameters:
     Type: String
     Default: 6a0347e22f184b03be8ca9afe8221cea
     Description: Public Builder Space identifier, not a private credential.
+  VercelCachePurge:
+    Type: String
+    Default: 'on'
+    AllowedValues: ['on', 'off']
+    Description: Purge Vercel's public-html cache tag after sync jobs; 'off' skips the purge.
   AlarmTopicArn:
     Type: String
     Default: ''
@@ -256,6 +261,7 @@ Resources:
           AWS_BUCKET_NAME: !Ref AssetsBucketName
           AWS_CLOUDFRONT_DISTRIBUTION_ID: !Ref CloudFrontDistributionId
           NEXT_PUBLIC_BUILDER_API_KEY: !Ref BuilderPublicApiKey
+          VERCEL_CACHE_PURGE: !Ref VercelCachePurge
       Policies:
         - Version: '2012-10-17'
           Statement:

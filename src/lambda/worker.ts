@@ -19,17 +19,27 @@ async function publishingSecrets() {
   return values as { BUILDER_PRIVATE_KEY: string; VERCEL_DEPLOY_WEBHOOK: string; VERCEL_API_TOKEN?: string };
 }
 
+const purgeSwitchedOff = () => ['off','false','0','disabled'].includes((process.env.VERCEL_CACHE_PURGE || '').trim().toLowerCase());
+type PurgeResult = { ok: true; form: 'delete' | 'invalidate' } | { ok: false; status: number | string };
+
 // Vercel's shared HTML otherwise keeps serving for up to an hour after CloudFront refreshes.
 // Delete rather than invalidate when pages were removed, so a removed page is never served again.
-async function purgePublicHtml(token: string, removed: boolean) {
-  const action = removed ? 'dangerously-delete-by-tags' : 'invalidate-by-tags';
-  const response = await fetch(`https://api.vercel.com/v1/edge-cache/${action}?projectIdOrName=${encodeURIComponent(process.env.VERCEL_PROJECT_ID!)}&teamId=${encodeURIComponent(process.env.VERCEL_TEAM_ID!)}`, {
-    method:'POST', redirect:'error', signal:AbortSignal.timeout(30_000),
-    headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},
-    body:JSON.stringify({tags:'public-html'}),
-  });
-  await response.body?.cancel();
-  if (!response.ok) throw new Error('Vercel cache purge not confirmed');
+// Returns the outcome instead of throwing: the content is already live by now.
+async function purgePublicHtml(token: string, removed: boolean): Promise<PurgeResult> {
+  const form = removed ? 'delete' : 'invalidate';
+  try {
+    const action = removed ? 'dangerously-delete-by-tags' : 'invalidate-by-tags';
+    const response = await fetch(`https://api.vercel.com/v1/edge-cache/${action}?projectIdOrName=${encodeURIComponent(process.env.VERCEL_PROJECT_ID!)}&teamId=${encodeURIComponent(process.env.VERCEL_TEAM_ID!)}`, {
+      method:'POST', redirect:'error', signal:AbortSignal.timeout(30_000),
+      headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},
+      body:JSON.stringify({tags:'public-html'}),
+    });
+    await response.body?.cancel();
+    return response.ok ? { ok: true, form } : { ok: false, status: response.status };
+  } catch (error) {
+    const name = (error as Error | undefined)?.name;
+    return { ok: false, status: typeof name === 'string' && /^[A-Za-z]{1,64}$/.test(name) ? name : 'Error' };
+  }
 }
 
 async function processJob(jobId: string, context: Context, mode: 'sync' | 'deploy' = 'deploy', pageId?: string, requestHash?: string, slack?: {channel:string;ts:string}) {
@@ -102,8 +112,20 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
     await waitUntilInvalidationCompleted({ client: cf, maxWaitTime: Math.min(remaining,300), minDelay: 10, maxDelay: 20 }, { DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, Id: invalidationId });
     if (mode === 'sync') {
       // Deploy jobs skip this: their new deployment starts with an empty cache.
-      if (secrets.VERCEL_API_TOKEN) await purgePublicHtml(secrets.VERCEL_API_TOKEN, removedKeys.length > 0);
-      await update({ status:'synced', phase:'synced', updatedAt:Math.floor(Date.now()/1000) });
+      let vercelPurge: PurgeResult | undefined;
+      if (purgeSwitchedOff()) console.log(JSON.stringify({ jobId, event:'vercel_purge_skipped' }));
+      else if (secrets.VERCEL_API_TOKEN) {
+        phase='purging';
+        await update({ phase, updatedAt:Math.floor(Date.now()/1000) });
+        vercelPurge = await purgePublicHtml(secrets.VERCEL_API_TOKEN, removedKeys.length > 0);
+        if (!vercelPurge.ok) {
+          // Report instead of retrying: redeliveries would hold the FIFO queue for hours.
+          console.error(JSON.stringify({ jobId, event:'vercel_purge_failed', status:vercelPurge.status }));
+          await update({ status:'attention_required', phase, vercelPurge, updatedAt:Math.floor(Date.now()/1000) });
+          return;
+        }
+      }
+      await update({ status:'synced', phase:'synced', ...(vercelPurge ? { vercelPurge } : {}), updatedAt:Math.floor(Date.now()/1000) });
       console.log(JSON.stringify({jobId,status:'synced'}));
       return;
     }

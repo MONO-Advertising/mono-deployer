@@ -10,6 +10,7 @@ const fingerprint = (mode='deploy',pageId=undefined) => crypto.createHash('sha25
 const command = class { constructor(input) { this.input = input; } };
 function harness(options = {}) {
   const calls = [];
+  const logs = [];
   const env = { PUBLISH_ENABLED: 'true', JOBS_TABLE: 'jobs', QUEUE_URL: 'queue', INGRESS_SECRET_ARN: 'ingress', PUBLISHING_SECRET_ARN: 'publishing', AWS_CLOUDFRONT_DISTRIBUTION_ID: 'distribution', VERCEL_TEAM_ID:'team_fixture', VERCEL_PROJECT_ID:'prj_fixture', VERCEL_GITHUB_REPO_ID:'12345', ...options.env };
   const common = {
     table:'jobs', requirePatchedNode() {},
@@ -32,13 +33,13 @@ function harness(options = {}) {
     vm.runInNewContext(fs.readFileSync(filename,'utf8'),{
       module,exports:module.exports,require:name=>mocks[name] || realRequire(name),
       process:{env,versions:{node:'22.23.4'}},URL,Buffer,AbortSignal,
-      console:{log(){},error(){},warn(){}},fetch:async(url,config)=>{
-        if(String(url).startsWith('https://api.vercel.com/v1/edge-cache/')){calls.push(['purge',String(url),config]);return new Response('{}',{status:options.purgeStatus || 200});}
+      console:{log:(...args)=>logs.push(args.join(' ')),error:(...args)=>logs.push(args.join(' ')),warn(){}},fetch:async(url,config)=>{
+        if(String(url).startsWith('https://api.vercel.com/v1/edge-cache/')){calls.push(['purge',String(url),config]);if(options.purgeError)throw options.purgeError;return new Response('{}',{status:options.purgeStatus || 200});}
         calls.push(['hook',url,config]);if(options.hookError)throw Error('timeout');return new Response(JSON.stringify(options.fetchBody ?? {job:{id:'vercel-job'}}),{status:options.fetchStatus || 200});}
     },{filename});
     return module.exports;
   }
-  return {load,calls,env};
+  return {load,calls,env,logs};
 }
 const event = (headers = {}, method='POST') => ({headers:{'x-deployment-key':'fixture-secret','idempotency-key':'submission-123456',...headers},requestContext:{http:{method}},rawPath:'/api/deploy'});
 const records = {Records:[{messageId:'message',body:JSON.stringify({jobId:id,requestHash:fingerprint()})}]};
@@ -301,7 +302,10 @@ test('sync records removed pages, invalidates their paths, then purges Vercel wi
   assert.deepEqual(JSON.parse(request.body),{tags:'public-html'});
   const purgeIndex=h.calls.indexOf(purges(h)[0]);
   assert.ok(h.calls.findIndex(c=>c[0]==='wait')<purgeIndex);
-  assert.ok(purgeIndex<h.calls.findIndex(c=>c[0]==='db'&&fields(c[1]).status==='synced'));
+  const purging=h.calls.findIndex(c=>c[0]==='db'&&fields(c[1]).phase==='purging');
+  assert.ok(purging>=0&&purging<purgeIndex,'the job shows the purging step while it runs');
+  const synced=h.calls.findIndex(c=>c[0]==='db'&&fields(c[1]).status==='synced');
+  assert.ok(purgeIndex<synced);assert.deepEqual({...fields(h.calls[synced][1]).vercelPurge},{ok:true,form:'delete'});
   assert.equal(h.calls.filter(c=>c[0]==='hook').length,0);
 });
 
@@ -310,16 +314,37 @@ test('sync purges with the invalidate form when nothing was removed, and not at 
   assert.equal((await h.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
   assert.deepEqual(purges(h).map(c=>c[1]),[purgeUrl('invalidate-by-tags')]);
   assert.equal(updates(h).map(fields).find(v=>v.paths).pagesRemoved,0);
+  assert.deepEqual({...updates(h).map(fields).find(v=>v.status==='synced').vercelPurge},{ok:true,form:'invalidate'});
   const tokenless=harness({exported:removal});
   assert.equal((await tokenless.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
   assert.equal(purges(tokenless).length,0);assert.ok(statuses(tokenless).includes('synced'));
 });
 
-test('a rejected Vercel purge fails the sync job for retry instead of reporting synced',async()=>{
-  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},purgeStatus:403});
-  const result=await h.load('worker').handler(syncRecord(),context);
-  assert.equal(result.batchItemFailures.length,1);assert.equal(purges(h).length,1);
-  assert.ok(statuses(h).includes('retry'));assert.ok(!statuses(h).includes('synced'));
+test('a failed Vercel purge ends the sync job as attention_required with its status, without blocking the queue',async()=>{
+  for (const [failure,status] of [[{purgeStatus:403},403],[{purgeError:Object.assign(Error('aborted'),{name:'TimeoutError'})},'TimeoutError']]) {
+    const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},...failure});
+    const result=await h.load('worker').handler(syncRecord(),context);
+    assert.equal(result.batchItemFailures.length,0,'the message is acknowledged; content is already live');
+    assert.equal(purges(h).length,1);
+    assert.deepEqual(statuses(h).slice(-1),['attention_required']);assert.ok(!statuses(h).includes('synced'));assert.ok(!statuses(h).includes('retry'));
+    const final=updates(h).map(fields).find(v=>v.status==='attention_required');
+    assert.equal(final.phase,'purging');assert.deepEqual({...final.vercelPurge},{ok:false,status});
+    assert.ok(h.logs.some(line=>line===JSON.stringify({jobId:id,event:'vercel_purge_failed',status})));
+    assert.ok(h.logs.every(line=>!line.includes('fixture-token')));
+  }
+});
+
+test('VERCEL_CACHE_PURGE off, false, 0 or disabled skips the purge; any other value purges',async()=>{
+  for (const value of ['off','false','0','disabled',' OFF ']) {
+    const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},env:{VERCEL_CACHE_PURGE:value}});
+    assert.equal((await h.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
+    assert.equal(purges(h).length,0,value);assert.ok(statuses(h).includes('synced'));
+    assert.ok(h.logs.some(line=>line===JSON.stringify({jobId:id,event:'vercel_purge_skipped'})));
+  }
+  for (const value of ['on','true','yes']) {
+    const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},env:{VERCEL_CACHE_PURGE:value}});
+    await h.load('worker').handler(syncRecord(),context);assert.equal(purges(h).length,1,value);
+  }
 });
 
 test('deploy jobs invalidate removed paths but leave Vercel purging to the new deployment',async()=>{
