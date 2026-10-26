@@ -94,7 +94,12 @@ async function deleteSnapshots(keys: string[]): Promise<void> {
     const result = await s3.send(new DeleteObjectsCommand({
       Bucket: process.env.AWS_BUCKET_NAME, Delete: { Objects: keys.slice(i, i + 1000).map(Key => ({ Key })), Quiet: true },
     }));
-    if (result.Errors?.length) throw new Error('Snapshot removal failed');
+    if (result.Errors?.length) {
+      // Keys stay in the log; the error message only carries the first S3 code.
+      const codes = result.Errors.map(error => String(error.Code));
+      console.error(JSON.stringify({ event: 'snapshot_removal_failed', codes, keys: result.Errors.map(error => error.Key) }));
+      throw new Error(`Snapshot removal failed (${codes[0]})`);
+    }
   }
 }
 
@@ -156,9 +161,11 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       // The public key still reads unpublished drafts; a deleted page is gone entirely.
       const draft = await fetchOneEntry({ ...common, options: { ...common.options, includeUnpublished: true }, query: { id: pageId } });
       const key = draft ? snapshotKey(draft, storage.prefix) : undefined;
-      // Reconcile everything when the key is unknown or a published page (another one at
-      // the same URL, or this one re-published since) still writes it.
-      if (!key || (await listPublishedPages(common, KEY_FIELDS)).some(entry => snapshotKey(entry, storage.prefix) === key)) {
+      // Reconcile everything when the key is unknown, the listing cannot prove nobody owns
+      // it (empty, or entries without targeting), or a published page (another one at the
+      // same URL, or this one re-published since) still writes it.
+      const owners = key ? await listPublishedPages(common, KEY_FIELDS) : [];
+      if (!key || !owners.length || owners.some(entry => !Array.isArray(entry.query) || snapshotKey(entry, storage.prefix) === key)) {
         return pushToEnvironment(undefined, options);
       }
       await deleteSnapshots([key]);

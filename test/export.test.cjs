@@ -15,6 +15,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
   const pageRequests = [];
   const entryRequests = [];
   const assetRequests = [];
+  const logs = [];
   // Builder hides drafts unless the request includes unpublished entries.
   const visible = (list, options) => list.filter(entry => options?.includeUnpublished || entry.published !== 'draft');
   const env = {
@@ -31,7 +32,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
         if (providers.s3Send) return providers.s3Send(command);
         if (command.list) return { Contents: (providers.objects || []).filter(Key => Key.startsWith(command.input.Prefix)).map(Key => ({ Key })), IsTruncated: false };
         if (command.copy) { copies.push(command.input); return {}; }
-        if (command.remove) { deletes.push(command.input); return {}; }
+        if (command.remove) { deletes.push(command.input); return providers.deleteResult ?? {}; }
         throw Object.assign(new Error('missing'), { name: 'NotFound' });
       } },
       ListObjectsV2Command: class { constructor(input) { this.input = input; this.list = true; } },
@@ -51,7 +52,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
       fetchEntries: async (request) => {
         pageRequests.push(request);
         const offset = request.offset ?? request.options?.offset ?? 0;
-        const listed = providers.pageList ? providers.pageList(pageRequests.length) : pages;
+        const listed = providers.pageList ? providers.pageList(pageRequests.length, request) : pages;
         return structuredClone(visible(listed, request.options).slice(offset, offset + request.limit));
       },
       fetchOneEntry: async (request) => {
@@ -83,7 +84,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
         return realRequire(name);
       },
       process: { env }, URL, Buffer, AbortSignal, Response,
-      console: { log() {}, warn() {}, error() {} },
+      console: { log() {}, warn: (...args) => logs.push(args.join(' ')), error: (...args) => logs.push(args.join(' ')) },
       fetch: async (_url, request) => {
         if (new URL(_url).pathname === '/api/v3/content/page') {
           const fixture = pages.find(page => page.id === new URL(_url).searchParams.get('query.id'));
@@ -100,7 +101,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
     vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
     return module.exports;
   }
-  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, deletes, invalidations, pageRequests, entryRequests, assetRequests, s3Requests };
+  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, deletes, invalidations, pageRequests, entryRequests, assetRequests, s3Requests, logs };
 }
 
 function page(id, image) {
@@ -538,4 +539,32 @@ test('single-page sync of a page Builder no longer has falls back to the full re
   assert.deepEqual(removedBatches(h), [[snapshot('gone.json')]]);
   assert.equal(result.pagesRemoved, 1);
   assert.deepEqual(Array.from(result.removedKeys), [snapshot('gone.json')]);
+});
+
+test('an empty or keyless ownership listing falls back to the full reconcile instead of deleting the unpublished key', async () => {
+  const live = { ...page('contact'), id: 'contact-v2' };
+  const retired = { ...page('contact'), id: 'contact-v1', published: 'draft' };
+  for (const keysOnly of [() => [], pages => pages.map(({ query, ...entry }) => entry)]) {
+    const h = harness([live, retired], [], {}, {
+      objects: [snapshot('contact.json')],
+      pageList: (_call, request) => request.fields === 'id,query,data.exportslug' ? keysOnly([live]) : [live],
+    });
+    const result = await h.load('push-to-env').pushToEnvironment('contact-v1', { invalidate: false });
+    assert.equal(h.deletes.length, 0, 'the live page at the same URL keeps its snapshot');
+    assert.deepEqual(Array.from(result.paths), ['/' + snapshot('contact.json')], 'the full reconcile ran');
+  }
+});
+
+test('a partial DeleteObjects failure fails the export and logs codes and keys without putting keys in the error', async () => {
+  const h = harness([page('home')], [], {}, {
+    objects: ['home.json', 'gone.json', 'stuck.json'].map(snapshot),
+    deleteResult: { Errors: [{ Key: snapshot('stuck.json'), Code: 'AccessDenied', Message: 'Access Denied' }] },
+  });
+  await assert.rejects(h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false }), error => {
+    assert.equal(error.message, 'Snapshot removal failed (AccessDenied)');
+    return true;
+  });
+  assert.equal(h.invalidations.length, 0);
+  const logged = h.logs.map(line => { try { return JSON.parse(line); } catch { return {}; } }).find(entry => entry.event === 'snapshot_removal_failed');
+  assert.deepEqual(logged, { event: 'snapshot_removal_failed', codes: ['AccessDenied'], keys: [snapshot('stuck.json')] });
 });
