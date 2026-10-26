@@ -19,6 +19,19 @@ async function publishingSecrets() {
   return values as { BUILDER_PRIVATE_KEY: string; VERCEL_DEPLOY_WEBHOOK: string; VERCEL_API_TOKEN?: string };
 }
 
+// Vercel's shared HTML otherwise keeps serving for up to an hour after CloudFront refreshes.
+// Delete rather than invalidate when pages were removed, so a removed page is never served again.
+async function purgePublicHtml(token: string, removed: boolean) {
+  const action = removed ? 'dangerously-delete-by-tags' : 'invalidate-by-tags';
+  const response = await fetch(`https://api.vercel.com/v1/edge-cache/${action}?projectIdOrName=${encodeURIComponent(process.env.VERCEL_PROJECT_ID!)}&teamId=${encodeURIComponent(process.env.VERCEL_TEAM_ID!)}`, {
+    method:'POST', redirect:'error', signal:AbortSignal.timeout(30_000),
+    headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},
+    body:JSON.stringify({tags:'public-html'}),
+  });
+  await response.body?.cancel();
+  if (!response.ok) throw new Error('Vercel cache purge not confirmed');
+}
+
 async function processJob(jobId: string, context: Context, mode: 'sync' | 'deploy' = 'deploy', pageId?: string, requestHash?: string, slack?: {channel:string;ts:string}) {
   const expectedHash = createHash('sha256').update(JSON.stringify({ mode, pageId })).digest('hex');
   if (requestHash !== expectedHash) throw new Error('Invalid request fingerprint');
@@ -58,6 +71,7 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
     const { pushAssets } = await import('../lib/assets');
     const { pushToEnvironment } = await import('../lib/push-to-env');
     let paths = prior?.paths as string[] | undefined;
+    let removedKeys = (prior?.removedKeys ?? []) as string[];
     if (!paths) {
       await update({phase, updatedAt:Math.floor(Date.now()/1000)});
       const assets = await pushAssets({onProgress: p => progress({assetTotal:p.total,assetCompleted:p.completed,assetUploaded:p.uploaded,assetSkipped:p.skipped,assetFailed:p.failed},p.completed===p.total)});
@@ -66,15 +80,18 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
       await update({phase, updatedAt:Math.floor(Date.now()/1000)});
       const exported = await pushToEnvironment(pageId, { invalidate: false, onProgress:p=>progress({pageTotal:p.total,pageCompleted:p.completed},p.completed===p.total) });
       paths = exported.paths;
+      removedKeys = exported.removedKeys;
       if (exported.missingAssets?.length) await update({ missingAssetCount: exported.missingAssets.length });
-      if (!paths.length) throw new Error('No published pages exported');
-      await update({ paths, updatedAt: Math.floor(Date.now()/1000) });
+      if (!paths.length && !removedKeys.length) throw new Error('No published pages exported');
+      // Removals checkpoint with the paths so a retry still invalidates and purges them.
+      await update({ paths, pagesRemoved: exported.pagesRemoved, removedKeys, ...(exported.reconcileSkipped ? { reconcileSkipped: exported.reconcileSkipped } : {}), updatedAt: Math.floor(Date.now()/1000) });
     }
+    const invalidationPaths = [...paths, ...removedKeys.map(key => '/' + key)];
     phase='invalidating';
     await update({phase, updatedAt:Math.floor(Date.now()/1000)});
     let invalidationId = prior?.invalidationId as string | undefined;
     if (!invalidationId) {
-      const response = await cf.send(new CreateInvalidationCommand({ DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, InvalidationBatch: { CallerReference: jobId, Paths: { Quantity: paths.length, Items: paths } } }));
+      const response = await cf.send(new CreateInvalidationCommand({ DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, InvalidationBatch: { CallerReference: jobId, Paths: { Quantity: invalidationPaths.length, Items: invalidationPaths } } }));
       invalidationId = response.Invalidation?.Id;
       if (!invalidationId) throw new Error('Invalidation not created');
       await update({ invalidationId });
@@ -83,6 +100,8 @@ async function processJob(jobId: string, context: Context, mode: 'sync' | 'deplo
     if (remaining < 30) throw new Error('Insufficient time for invalidation');
     await waitUntilInvalidationCompleted({ client: cf, maxWaitTime: Math.min(remaining,300), minDelay: 10, maxDelay: 20 }, { DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID!, Id: invalidationId });
     if (mode === 'sync') {
+      // Deploy jobs skip this: their new deployment starts with an empty cache.
+      if (secrets.VERCEL_API_TOKEN) await purgePublicHtml(secrets.VERCEL_API_TOKEN, removedKeys.length > 0);
       await update({ status:'synced', phase:'synced', updatedAt:Math.floor(Date.now()/1000) });
       console.log(JSON.stringify({jobId,status:'synced'}));
       return;

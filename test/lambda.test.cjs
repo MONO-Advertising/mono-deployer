@@ -24,7 +24,7 @@ function harness(options = {}) {
     '@aws-sdk/client-sqs':{SendMessageCommand:command,SQSClient:class { async send(cmd) { calls.push(['sqs',cmd.input]); if (options.queueError) throw Error('queue unavailable'); return {}; } }},
     '@aws-sdk/client-cloudfront':{CreateInvalidationCommand:command,CloudFrontClient:class {async send(cmd) {calls.push(['cf',cmd.input]);return {Invalidation:{Id:'invalidation'}};}},waitUntilInvalidationCompleted:async()=>{calls.push(['wait']);}},
     '../lib/assets':{pushAssets:async(config)=>{calls.push(['assets']); for (const value of options.assetProgress || []) { try { await config?.onProgress?.(value); } catch {} } return {failed:options.failedAssets || [],uploaded:[],skipped:[]};}},
-    '../lib/push-to-env':{pushToEnvironment:async(pageId,config)=>{calls.push(['pages',pageId,config]); for (const value of options.pageProgress || []) { try { await config?.onProgress?.(value); } catch {} } return {paths:['/builder/pages/home.json']};}}
+    '../lib/push-to-env':{pushToEnvironment:async(pageId,config)=>{calls.push(['pages',pageId,config]); for (const value of options.pageProgress || []) { try { await config?.onProgress?.(value); } catch {} } return options.exported ?? {paths:['/builder/pages/home.json'],missingAssets:[],pagesRemoved:0,removedKeys:[]};}}
   };
   function load(name) {
     const filename=path.resolve(__dirname,'../dist/lambda',name+'.js');
@@ -32,7 +32,9 @@ function harness(options = {}) {
     vm.runInNewContext(fs.readFileSync(filename,'utf8'),{
       module,exports:module.exports,require:name=>mocks[name] || realRequire(name),
       process:{env,versions:{node:'22.23.4'}},URL,Buffer,AbortSignal,
-      console:{log(){},error(){},warn(){}},fetch:async(url,config)=>{calls.push(['hook',url,config]);if(options.hookError)throw Error('timeout');return new Response(JSON.stringify(options.fetchBody ?? {job:{id:'vercel-job'}}),{status:options.fetchStatus || 200});}
+      console:{log(){},error(){},warn(){}},fetch:async(url,config)=>{
+        if(String(url).startsWith('https://api.vercel.com/v1/edge-cache/')){calls.push(['purge',String(url),config]);return new Response('{}',{status:options.purgeStatus || 200});}
+        calls.push(['hook',url,config]);if(options.hookError)throw Error('timeout');return new Response(JSON.stringify(options.fetchBody ?? {job:{id:'vercel-job'}}),{status:options.fetchStatus || 200});}
     },{filename});
     return module.exports;
   }
@@ -275,4 +277,62 @@ test('Vercel API timeout retains durable dispatch intent and stops automatic red
   assert.ok(intentIndex>=0&&intentIndex<hookIndex);
   assert.equal(h.calls.filter(c=>c[0]==='hook').length,1);assert.ok(statuses(h).includes('hook_unknown'));
   assert.ok(!statuses(h).includes('retry'));
+});
+
+// Removal and Vercel cache refresh (plan B8, B7).
+const syncRecord = (pageId='page-123') => ({Records:[{messageId:'sync',body:JSON.stringify({jobId:id,mode:'sync',pageId,requestHash:fingerprint('sync',pageId)})}]});
+const purges = h => h.calls.filter(c=>c[0]==='purge');
+const purgeUrl = action => `https://api.vercel.com/v1/edge-cache/${action}?projectIdOrName=prj_fixture&teamId=team_fixture`;
+const removal = {paths:[],missingAssets:[],pagesRemoved:1,removedKeys:['builder/pages/retired.json']};
+
+test('sync records removed pages, invalidates their paths, then purges Vercel with the delete form before reporting synced',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},exported:removal});
+  const result=await h.load('worker').handler(syncRecord(),context);
+  assert.equal(result.batchItemFailures.length,0);
+  const checkpoint=updates(h).map(fields).find(v=>v.paths);
+  assert.deepEqual(Array.from(checkpoint.paths),[]);assert.equal(checkpoint.pagesRemoved,1);assert.deepEqual(Array.from(checkpoint.removedKeys),['builder/pages/retired.json']);
+  const cf=h.calls.find(c=>c[0]==='cf');
+  assert.deepEqual(Array.from(cf[1].InvalidationBatch.Paths.Items),['/builder/pages/retired.json']);assert.equal(cf[1].InvalidationBatch.Paths.Quantity,1);
+  assert.equal(purges(h).length,1);
+  const [,url,request]=purges(h)[0];
+  assert.equal(url,purgeUrl('dangerously-delete-by-tags'));
+  assert.equal(request.method,'POST');assert.equal(request.redirect,'error');assert.ok(request.signal);
+  assert.equal(request.headers.authorization,'Bearer fixture-token');assert.equal(request.headers['content-type'],'application/json');
+  assert.deepEqual(JSON.parse(request.body),{tags:'public-html'});
+  const purgeIndex=h.calls.indexOf(purges(h)[0]);
+  assert.ok(h.calls.findIndex(c=>c[0]==='wait')<purgeIndex);
+  assert.ok(purgeIndex<h.calls.findIndex(c=>c[0]==='db'&&fields(c[1]).status==='synced'));
+  assert.equal(h.calls.filter(c=>c[0]==='hook').length,0);
+});
+
+test('sync purges with the invalidate form when nothing was removed, and not at all without a Vercel token',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'}});
+  assert.equal((await h.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
+  assert.deepEqual(purges(h).map(c=>c[1]),[purgeUrl('invalidate-by-tags')]);
+  assert.equal(updates(h).map(fields).find(v=>v.paths).pagesRemoved,0);
+  const tokenless=harness({exported:removal});
+  assert.equal((await tokenless.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
+  assert.equal(purges(tokenless).length,0);assert.ok(statuses(tokenless).includes('synced'));
+});
+
+test('a rejected Vercel purge fails the sync job for retry instead of reporting synced',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},purgeStatus:403});
+  const result=await h.load('worker').handler(syncRecord(),context);
+  assert.equal(result.batchItemFailures.length,1);assert.equal(purges(h).length,1);
+  assert.ok(statuses(h).includes('retry'));assert.ok(!statuses(h).includes('synced'));
+});
+
+test('deploy jobs invalidate removed paths but leave Vercel purging to the new deployment',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},fetchBody:{id:'dpl_exact',projectId:'prj_fixture',url:'fixture.vercel.app'},exported:{...removal,paths:['/builder/pages/home.json']}});
+  assert.equal((await h.load('worker').handler(records,context)).batchItemFailures.length,0);
+  assert.deepEqual(Array.from(h.calls.find(c=>c[0]==='cf')[1].InvalidationBatch.Paths.Items),['/builder/pages/home.json','/builder/pages/retired.json']);
+  assert.equal(purges(h).length,0);assert.ok(statuses(h).includes('deployment_requested'));
+});
+
+test('checkpoint retry invalidates recorded removals and keeps the delete-form purge without exporting again',async()=>{
+  const h=harness({publishingSecret:{VERCEL_API_TOKEN:'fixture-token'},prior:{status:'retry',requestHash:fingerprint('sync','page-123'),paths:[],pagesRemoved:1,removedKeys:['builder/pages/retired.json']}});
+  assert.equal((await h.load('worker').handler(syncRecord(),context)).batchItemFailures.length,0);
+  assert.ok(!h.calls.some(c=>['assets','pages'].includes(c[0])));
+  assert.deepEqual(Array.from(h.calls.find(c=>c[0]==='cf')[1].InvalidationBatch.Paths.Items),['/builder/pages/retired.json']);
+  assert.deepEqual(purges(h).map(c=>c[1]),[purgeUrl('dangerously-delete-by-tags')]);assert.ok(statuses(h).includes('synced'));
 });
