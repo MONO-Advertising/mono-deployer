@@ -1,10 +1,10 @@
 import path from 'path';
 import { fetchEntries, fetchOneEntry } from '@builder.io/sdk-react';
-import { S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectsCommand, S3Client } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { CloudFrontClient, CreateInvalidationCommand, waitUntilInvalidationCompleted } from '@aws-sdk/client-cloudfront';
 import { fetchAsset, validateAssetUrl } from './asset-fetch';
-import { computeS3KeyParts, exportStorageConfig } from './assets';
+import { computeS3KeyParts, existingKeys, exportStorageConfig } from './assets';
 
 const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-2' });
 const cloudfront = new CloudFrontClient({ region: 'us-east-1' });
@@ -56,6 +56,78 @@ async function replaceUrls(obj: any, cache: Map<string, string>, missingAssets: 
   }
 }
 
+/** A routable page's snapshot key: the rule mono-dotcom scripts/audit-orphan-snapshots.ts mirrors, exportslug included. */
+function snapshotKey(page: any, prefix: string): string | undefined {
+  const query = page.query?.find((q: any) => q.property === 'urlPath');
+  if (!query) return undefined;
+  const rawPath = Array.isArray(query.value) ? query.value[0] : query.value;
+  if (typeof rawPath !== 'string') throw new Error('Invalid published page URL path');
+  const decoded = safeDecodePath(rawPath);
+  const parts = (decoded === '/' ? '/index' : decoded).split('/').filter(Boolean);
+  if (parts.some(part => part === '.' || part === '..' || /[\\\x00-\x1f]/.test(part))) throw new Error('Unsafe published page URL path');
+  const filename = sanitizeFilename(page.data?.exportslug || parts.at(-1) || 'index') + '.json';
+  return path.posix.join(prefix, 'pages', ...parts.slice(0, -1), filename);
+}
+
+const builderRequest = (apiKey: string) => ({
+  model: 'page', apiKey,
+  options: { includeUnpublished: false, includeRefs: true, cachebust: true },
+  canTrack: false,
+});
+type BuilderRequest = ReturnType<typeof builderRequest>;
+
+async function listPublishedPages(common: BuilderRequest, fields?: string): Promise<any[]> {
+  const pages: any[] = [];
+  for (let offset = 0; ; offset += 100) {
+    const batch = await fetchEntries({ ...common, limit: 100, offset, fields, options: { ...common.options, 'sort.id': 1 } });
+    if (!Array.isArray(batch)) throw new Error('Invalid Builder page listing');
+    pages.push(...batch);
+    if (batch.length < 100) return pages;
+  }
+}
+
+/** Plain deletes: the bucket is versioned, so each removal is a delete marker that can be undone. */
+async function deleteSnapshots(keys: string[]): Promise<void> {
+  for (let i = 0; i < keys.length; i += 1000) {
+    const result = await s3.send(new DeleteObjectsCommand({
+      Bucket: process.env.AWS_BUCKET_NAME, Delete: { Objects: keys.slice(i, i + 1000).map(Key => ({ Key })), Quiet: true },
+    }));
+    if (result.Errors?.length) throw new Error('Snapshot removal failed');
+  }
+}
+
+type Removal = { pagesRemoved: number; removedKeys: string[]; reconcileSkipped?: string };
+
+/** Remove every snapshot a full export did not write, unless Builder's list may be incomplete. */
+async function reconcile(common: BuilderRequest, pages: any[], written: Set<string>, prefix: string): Promise<Removal> {
+  const skip = (reason: string): Removal => {
+    console.warn(JSON.stringify({ event: 'reconcile_skipped', reason }));
+    return { pagesRemoved: 0, removedKeys: [], reconcileSkipped: reason };
+  };
+  // A failed or empty enumeration must never empty production.
+  if (!pages.length) return skip('Builder returned no published pages');
+  const stale = [...await existingKeys(`${prefix}/pages/`)].filter(key => key.endsWith('.json') && !written.has(key)).sort();
+  if (!stale.length) return { pagesRemoved: 0, removedKeys: [] };
+  // Offset paging skips a page when an earlier one is unpublished mid-listing, so a
+  // fresh listing must not contain any page this export did not see.
+  const seen = new Set(pages.map(page => page.id));
+  if ((await listPublishedPages(common, 'id')).some(page => !seen.has(page.id))) return skip('Builder page listing was incomplete or changed during export');
+  await deleteSnapshots(stale);
+  return { pagesRemoved: stale.length, removedKeys: stale };
+}
+
+async function invalidate(paths: string[], options: ExportOptions): Promise<void> {
+  if (options.invalidate === false || !paths.length) return;
+  const result = await cloudfront.send(new CreateInvalidationCommand({
+    DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID,
+    InvalidationBatch: { CallerReference: options.callerReference || new Date().toISOString(), Paths: { Quantity: paths.length, Items: paths } },
+  }));
+  if (!result.Invalidation?.Id) throw new Error('CloudFront did not return an invalidation ID');
+  await waitUntilInvalidationCompleted({ client: cloudfront, maxWaitTime: 600 }, {
+    DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID, Id: result.Invalidation.Id,
+  });
+}
+
 export type PageProgress = { total: number; completed: number };
 // Called after enumeration and each processed item; callers own throttling/timeouts.
 // Awaited for ordering, but telemetry failures must never abort publishing.
@@ -63,28 +135,34 @@ export type ExportOptions = {
   invalidate?: boolean; callerReference?: string;
   onProgress?: (progress: PageProgress) => Promise<void> | void;
 };
-export const pushToEnvironment = async (pageId?: string, options: ExportOptions = {}): Promise<{ paths: string[]; missingAssets: string[] }> => {
+// paths: snapshots written; removedKeys: snapshots deleted (both are invalidated).
+export type ExportResult = { paths: string[]; missingAssets: string[] } & Removal;
+export const pushToEnvironment = async (pageId?: string, options: ExportOptions = {}): Promise<ExportResult> => {
   const storage = exportStorageConfig();
   const apiKey = process.env.NEXT_PUBLIC_BUILDER_API_KEY;
   if (!apiKey || !process.env.AWS_BUCKET_NAME || !process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID) {
     throw new Error('Builder public key, bucket and CloudFront distribution must be configured');
   }
-  const common = {
-    model: 'page', apiKey,
-    options: { includeUnpublished: false, includeRefs: true, cachebust: true },
-    canTrack: false,
-  };
+  const common = builderRequest(apiKey);
   const pages: any[] = [];
   if (pageId) {
     const page = await fetchOneEntry({ ...common, query: { id: pageId } });
-    if (!page) throw new Error('Published page not found');
+    if (!page) {
+      // The public key still reads unpublished drafts; a deleted page is gone entirely.
+      const draft = await fetchOneEntry({ ...common, options: { ...common.options, includeUnpublished: true }, query: { id: pageId } });
+      const key = draft ? snapshotKey(draft, storage.prefix) : undefined;
+      // Reconcile everything when the key is unknown or a published page (another one at
+      // the same URL, or this one re-published since) still writes it.
+      if (!key || (await listPublishedPages(common, 'id,query,data.exportslug')).some(entry => snapshotKey(entry, storage.prefix) === key)) {
+        return pushToEnvironment(undefined, options);
+      }
+      await deleteSnapshots([key]);
+      await invalidate(['/' + key], options);
+      return { paths: [], missingAssets: [], pagesRemoved: 1, removedKeys: [key] };
+    }
     pages.push(page);
   } else {
-    for (let offset = 0; ; offset += 100) {
-      const batch = await fetchEntries({ ...common, limit: 100, offset, options: { ...common.options, 'sort.id': 1 } });
-      pages.push(...batch);
-      if (batch.length < 100) break;
-    }
+    pages.push(...await listPublishedPages(common));
   }
   let completed = 0;
   const reportProgress = async () => {
@@ -129,19 +207,12 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
       parent.splice(parent.indexOf(symbol), 1, ...content.data.blocks);
     }
     await replaceUrls(page, assetUrlCache, missingAssets);
-    const query = page.query?.find((q: any) => q.property === 'urlPath');
-    if (!query) {
+    const s3Key = snapshotKey(page, storage.prefix);
+    if (!s3Key) {
       completed++;
       await reportProgress();
       continue;
     }
-    const rawPath = Array.isArray(query.value) ? query.value[0] : query.value;
-    if (typeof rawPath !== 'string') throw new Error('Invalid published page URL path');
-    const decoded = safeDecodePath(rawPath);
-    const parts = (decoded === '/' ? '/index' : decoded).split('/').filter(Boolean);
-    if (parts.some(part => part === '.' || part === '..' || /[\\\x00-\x1f]/.test(part))) throw new Error('Unsafe published page URL path');
-    const filename = sanitizeFilename(page.data?.exportslug || parts.at(-1) || 'index') + '.json';
-    const s3Key = path.posix.join(storage.prefix, 'pages', ...parts.slice(0, -1), filename);
     await new Upload({ client: s3, params: {
       Bucket: process.env.AWS_BUCKET_NAME, Key: s3Key, Body: JSON.stringify(page, null, 2), ContentType: 'application/json',
     } }).done();
@@ -150,15 +221,8 @@ export const pushToEnvironment = async (pageId?: string, options: ExportOptions 
     await reportProgress();
   }
   const uniquePaths = [...new Set(paths)];
-  if (options.invalidate !== false && uniquePaths.length) {
-    const result = await cloudfront.send(new CreateInvalidationCommand({
-      DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID,
-      InvalidationBatch: { CallerReference: options.callerReference || new Date().toISOString(), Paths: { Quantity: uniquePaths.length, Items: uniquePaths } },
-    }));
-    if (!result.Invalidation?.Id) throw new Error('CloudFront did not return an invalidation ID');
-    await waitUntilInvalidationCompleted({ client: cloudfront, maxWaitTime: 600 }, {
-      DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID, Id: result.Invalidation.Id,
-    });
-  }
-  return { paths: uniquePaths, missingAssets: [...missingAssets] };
+  const removal = pageId ? { pagesRemoved: 0, removedKeys: [] }
+    : await reconcile(common, pages, new Set(uniquePaths.map(written => written.slice(1))), storage.prefix);
+  await invalidate([...uniquePaths, ...removal.removedKeys.map(key => '/' + key)], options);
+  return { paths: uniquePaths, missingAssets: [...missingAssets], ...removal };
 };

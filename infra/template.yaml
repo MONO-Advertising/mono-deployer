@@ -271,6 +271,13 @@ Resources:
             - Effect: Allow
               Action: [s3:GetObject, s3:PutObject, s3:AbortMultipartUpload]
               Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/builder/*'
+            # Exports remove page snapshots Builder no longer publishes; the versioned
+            # bucket keeps each removal as an undoable delete marker.
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/builder/pages/*'
+                - !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/builder/validation/*'
             # Missing-object HEAD needs ListBucket to return 404 rather than 403.
             - Effect: Allow
               Action: s3:ListBucket

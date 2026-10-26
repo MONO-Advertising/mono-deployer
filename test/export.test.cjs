@@ -9,9 +9,14 @@ const { createRequire } = require('node:module');
 function harness(pages, assets = [], environment = {}, providers = {}) {
   const uploads = [];
   const copies = [];
+  const deletes = [];
+  const invalidations = [];
   const s3Requests = [];
   const pageRequests = [];
+  const entryRequests = [];
   const assetRequests = [];
+  // Builder hides drafts unless the request includes unpublished entries.
+  const visible = (list, options) => list.filter(entry => options?.includeUnpublished || entry.published !== 'draft');
   const env = {
     BUILDER_PRIVATE_KEY: 'fixture-private-key',
     NEXT_PUBLIC_BUILDER_API_KEY: 'fixture-public-key',
@@ -21,13 +26,21 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
   };
   const mocks = {
     '@aws-sdk/client-s3': {
-      S3Client: class { async send(command) { s3Requests.push(command); if (providers.s3Send) return providers.s3Send(command); if (command.list) return { Contents: [], IsTruncated: false }; if (command.copy) { copies.push(command.input); return {}; } throw Object.assign(new Error('missing'), { name: 'NotFound' }); } },
+      S3Client: class { async send(command) {
+        s3Requests.push(command);
+        if (providers.s3Send) return providers.s3Send(command);
+        if (command.list) return { Contents: (providers.objects || []).filter(Key => Key.startsWith(command.input.Prefix)).map(Key => ({ Key })), IsTruncated: false };
+        if (command.copy) { copies.push(command.input); return {}; }
+        if (command.remove) { deletes.push(command.input); return {}; }
+        throw Object.assign(new Error('missing'), { name: 'NotFound' });
+      } },
       ListObjectsV2Command: class { constructor(input) { this.input = input; this.list = true; } },
+      DeleteObjectsCommand: class { constructor(input) { this.input = input; this.remove = true; } },
       HeadObjectCommand: class { constructor(input) { this.input = input; } },
       CopyObjectCommand: class { constructor(input) { this.input = input; this.copy = true; } },
     },
     '@aws-sdk/client-cloudfront': {
-      CloudFrontClient: class { async send() { return { Invalidation: { Id: 'fixture-invalidation' } }; } },
+      CloudFrontClient: class { async send(command) { invalidations.push(command.input); return { Invalidation: { Id: 'fixture-invalidation' } }; } },
       waitUntilInvalidationCompleted: async () => ({}),
       CreateInvalidationCommand: class { constructor(input) { this.input = input; } },
     },
@@ -38,9 +51,13 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
       fetchEntries: async (request) => {
         pageRequests.push(request);
         const offset = request.offset ?? request.options?.offset ?? 0;
-        return structuredClone(pages.slice(offset, offset + request.limit));
+        const listed = providers.pageList ? providers.pageList(pageRequests.length) : pages;
+        return structuredClone(visible(listed, request.options).slice(offset, offset + request.limit));
       },
-      fetchOneEntry: async ({ query }) => structuredClone(pages.find(page => page.id === query.id)),
+      fetchOneEntry: async (request) => {
+        entryRequests.push(request);
+        return structuredClone(visible(pages, request.options).find(page => page.id === request.query.id));
+      },
     },
     './asset-fetch': {
       validateAssetUrl: (value) => {
@@ -83,7 +100,7 @@ function harness(pages, assets = [], environment = {}, providers = {}) {
     vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
     return module.exports;
   }
-  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, pageRequests, assetRequests, s3Requests };
+  return { load: name => load(path.resolve(__dirname, '../dist/lib', name + '.js')), uploads, copies, deletes, invalidations, pageRequests, entryRequests, assetRequests, s3Requests };
 }
 
 function page(id, image) {
@@ -138,6 +155,8 @@ test('isolated validation prefix applies to asset keys, page keys, URLs and inva
   assert.equal((await h.load('assets').pushAssets()).failed.length, 0);
   const result = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false });
   assert.ok(h.uploads.every(upload => upload.Key.startsWith(prefix + '/')));
+  assert.ok(h.s3Requests.some(command => command.list && command.input.Prefix === prefix + '/pages/'), 'reconcile lists the isolated prefix');
+  assert.ok(h.s3Requests.every(command => !command.list || command.input.Prefix.startsWith(prefix + '/')), 'validation never lists production keys');
   assert.equal(result.paths[0], '/' + prefix + '/pages/home.json');
   const content = JSON.parse(h.uploads.find(upload => upload.ContentType === 'application/json').Body);
   assert.equal(new URL(content.data.image).pathname, '/' + h.uploads.find(upload => upload.ContentType === 'image/png').Key);
@@ -381,4 +400,106 @@ test('missing inventory entry still HEAD checks before download, and access erro
     assert.equal(result.skipped.length, denied ? 0 : 1);
     assert.equal(h.uploads.length, 0);
   }
+});
+
+// Removal (plan B8). Kept keys follow mono-dotcom scripts/audit-orphan-snapshots.ts
+// expectedSnapshotKey(url, exportslug): '/' -> index.json, '/a/b' -> a/b.json, exportslug replaces the last segment.
+const snapshot = key => 'builder/pages/' + key;
+const removedBatches = h => h.deletes.map(input => Array.from(input.Delete.Objects, object => object.Key));
+
+test('full export deletes every snapshot key it did not produce, after all uploads, and invalidates the removed paths', async () => {
+  const root = { id: 'root', query: [{ property: 'urlPath', value: '/' }], data: { blocks: [] } };
+  const slugged = page('work/renamed');
+  slugged.data.exportslug = 'custom-slug';
+  const draft = { ...page('work/draft'), published: 'draft' };
+  const h = harness([root, page('work'), page('work/kept'), slugged, draft], [], {}, {
+    objects: ['index.json', 'work.json', 'work/kept.json', 'work/custom-slug.json', 'work/renamed.json', 'work/draft.json', 'lidl.json', 'notes.txt'].map(snapshot),
+    upload: async () => assert.equal(h.deletes.length, 0, 'removal happens only after every page is written'),
+  });
+  const result = await h.load('push-to-env').pushToEnvironment();
+  const removed = ['lidl.json', 'work/draft.json', 'work/renamed.json'].map(snapshot);
+  assert.deepEqual(removedBatches(h), [removed], 'one batch; non-JSON keys are not snapshots');
+  assert.equal(h.deletes[0].Bucket, 'fixture-bucket');
+  assert.equal(h.deletes[0].Delete.Objects.every(object => object.VersionId === undefined), true, 'plain delete writes markers');
+  assert.equal(result.pagesRemoved, 3);
+  assert.deepEqual(Array.from(result.removedKeys), removed);
+  assert.equal(result.reconcileSkipped, undefined);
+  assert.deepEqual(Array.from(result.paths).sort(), ['index.json', 'work.json', 'work/custom-slug.json', 'work/kept.json'].map(key => '/' + snapshot(key)));
+  assert.equal(h.invalidations.length, 1);
+  const { Paths } = h.invalidations[0].InvalidationBatch;
+  assert.deepEqual(Array.from(Paths.Items).sort(), [...result.paths, ...removed.map(key => '/' + key)].sort());
+  assert.equal(Paths.Quantity, Paths.Items.length);
+});
+
+test('reconcile refuses to delete anything when Builder returns zero published pages', async () => {
+  const h = harness([{ ...page('only-draft'), published: 'draft' }], [], {}, { objects: ['home.json', 'work.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false });
+  assert.equal(h.deletes.length, 0);
+  assert.equal(result.pagesRemoved, 0);
+  assert.deepEqual(Array.from(result.removedKeys), []);
+  assert.match(result.reconcileSkipped, /no published pages/i);
+});
+
+test('reconcile refuses to delete anything when the Builder listing stopped short or a page fetch failed', async () => {
+  // The export's listing lost /about; a fresh listing shows it, so no key may be removed.
+  const pages = [page('home'), page('about')];
+  const h = harness(pages, [], {}, {
+    objects: ['home.json', 'about.json', 'lidl.json'].map(snapshot),
+    pageList: call => call === 1 ? pages.slice(0, 1) : pages,
+  });
+  const result = await h.load('push-to-env').pushToEnvironment(undefined, { invalidate: false });
+  assert.equal(h.deletes.length, 0);
+  assert.equal(result.pagesRemoved, 0);
+  assert.deepEqual(Array.from(result.removedKeys), []);
+  assert.match(result.reconcileSkipped, /listing/i);
+  // A page that cannot be exported fails the job before anything is listed or removed.
+  const failed = harness([page('home'), page('broken', 'https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fbad.png')], [], {}, {
+    objects: ['home.json', 'lidl.json'].map(snapshot),
+    fetchAsset: async () => new Response(null, { status: 503 }),
+  });
+  await assert.rejects(failed.load('push-to-env').pushToEnvironment(undefined, { invalidate: false }), /Asset metadata request failed/);
+  assert.equal(failed.deletes.length, 0);
+  assert.ok(!failed.s3Requests.some(command => command.list));
+});
+
+test('single published page sync writes only that page and never reconciles', async () => {
+  const h = harness([page('home'), page('about')], [], {}, { objects: ['home.json', 'about.json', 'lidl.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment('home', { invalidate: false });
+  assert.deepEqual(Array.from(result.paths), ['/' + snapshot('home.json')]);
+  assert.equal(result.pagesRemoved, 0);
+  assert.equal(h.deletes.length, 0);
+  assert.equal(h.entryRequests.length, 1);
+});
+
+test('single-page sync of an unpublished page reads its draft and removes only its snapshot', async () => {
+  const draft = { ...page('work/retired'), published: 'draft' };
+  const h = harness([page('home'), draft], [], {}, { objects: ['home.json', 'work/retired.json', 'lidl.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment('work/retired');
+  assert.deepEqual(h.entryRequests.map(request => [request.query.id, request.options.includeUnpublished]), [['work/retired', false], ['work/retired', true]]);
+  assert.deepEqual(removedBatches(h), [[snapshot('work/retired.json')]]);
+  assert.equal(result.pagesRemoved, 1);
+  assert.deepEqual(Array.from(result.removedKeys), [snapshot('work/retired.json')]);
+  assert.deepEqual(Array.from(result.paths), []);
+  assert.equal(h.uploads.length, 0);
+  assert.deepEqual(Array.from(h.invalidations[0].InvalidationBatch.Paths.Items), ['/' + snapshot('work/retired.json')]);
+});
+
+test('unpublishing a page whose URL another published page serves keeps that snapshot', async () => {
+  const live = { ...page('contact'), id: 'contact-v2' };
+  const retired = { ...page('contact'), id: 'contact-v1', published: 'draft' };
+  const h = harness([live, retired], [], {}, { objects: [snapshot('contact.json')] });
+  const result = await h.load('push-to-env').pushToEnvironment('contact-v1', { invalidate: false });
+  assert.equal(h.deletes.length, 0);
+  assert.equal(result.pagesRemoved, 0);
+  assert.deepEqual(Array.from(result.paths), ['/' + snapshot('contact.json')], 'the full reconcile rewrites the live page');
+});
+
+test('single-page sync of a page Builder no longer has falls back to the full reconcile', async () => {
+  const h = harness([page('home')], [], {}, { objects: ['home.json', 'gone.json'].map(snapshot) });
+  const result = await h.load('push-to-env').pushToEnvironment('deleted-page', { invalidate: false });
+  assert.deepEqual(h.entryRequests.map(request => [request.query.id, request.options.includeUnpublished]), [['deleted-page', false], ['deleted-page', true]]);
+  assert.deepEqual(Array.from(result.paths), ['/' + snapshot('home.json')]);
+  assert.deepEqual(removedBatches(h), [[snapshot('gone.json')]]);
+  assert.equal(result.pagesRemoved, 1);
+  assert.deepEqual(Array.from(result.removedKeys), [snapshot('gone.json')]);
 });

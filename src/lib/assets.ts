@@ -224,10 +224,9 @@ const DOWNLOAD_CONCURRENCY = 2;
 const MAX_INVENTORY_KEYS = 50_000;
 
 /** Bound memory and requests even if a provider returns malformed pagination. */
-async function existingAssetKeys(): Promise<Set<string>> {
+export async function existingKeys(Prefix = `${exportStorageConfig().prefix}/`): Promise<Set<string>> {
   const keys = new Set<string>();
   const tokens = new Set<string>();
-  const Prefix = `${exportStorageConfig().prefix}/`;
   let ContinuationToken: string | undefined;
   for (let page = 0; page < 100; page++) {
     const result = await s3.send(new ListObjectsV2Command({
@@ -355,7 +354,7 @@ export type PushAssetsOptions = { onProgress?: (progress: AssetProgress) => Prom
 export const pushAssets = async (options: PushAssetsOptions = {}): Promise<PushAssetsResult> => {
   exportStorageConfig();
   const assets = await fetchAllAssets();
-  const inventory = await existingAssetKeys();
+  const inventory = await existingKeys();
   const download = boundedDownloads();
   const uploaded: PushAssetsResult['uploaded'] = [];
   const skipped: PushAssetsResult['skipped'] = [];
